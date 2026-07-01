@@ -1,25 +1,71 @@
+<p align="center">
+  <img src="assets/icon-256.png" width="120" alt="mylar3" />
+</p>
+
 # mylar3
 
-Mylar3 comic book (CBR/CBZ) downloader & manager — a first-party [orca](https://github.com/argyle-labs/orca) **service-backend**
-plugin. It registers a `ServiceBackend` and exposes **no tools of its own**: orca
-drives every plugin through the single generic `service.*` surface — `list`,
-`deploy`, `backup`, `restore`, `configure`, `status`. Rich, mylar3-specific data is
-surfaced through the **typed `service.status` payload**, never bespoke tools (one
-small API for the whole fleet).
+Mylar3 is an automated comic book (CBR/CBZ) downloader and manager.
 
-**Runtimes:** docker,podman,lxc.
+A first-party [orca](https://github.com/argyle-labs/orca) plugin (service-backend).
 
-**Design — pure Rust, zero bash.** No `compose.yml`, `Dockerfile`, or provision
-scripts. Deployment is rendered by orca's `deploy_target` from the backend's
-`WorkloadSpec`; backup/restore run through the pluggable `BackupMethod` (tar for
-containers/LXC, **Proxmox Backup Server** for Proxmox guests when available);
-`configure`/`status` call the upstream API. The only per-plugin code is the
-declarative descriptor plus `workload_spec`/`configure`/`status`.
+This repo is **self-contained** — the steps below run mylar3 **by hand, without orca**. orca automates exactly this (same image, ports, and data) through one generic surface.
 
-See [CAPABILITIES.md](CAPABILITIES.md) for the contract checklist.
+---
 
-## Manual setup & management
+## Run it without orca
 
-The plugin automates mylar3, but this repo is self-contained: the docs below (migrated + anonymized from a homelab runbook) let you deploy, configure, and operate it **entirely by hand** on any supported runtime.
+### Docker / Podman
 
-- [mylar3](docs/mylar3.md)
+```yaml
+# compose.yml
+services:
+  mylar3:
+    image: lscr.io/linuxserver/mylar3:latest
+    container_name: mylar3
+    restart: unless-stopped
+    ports:
+      - "8090:8090/tcp"   # web UI
+    volumes:
+      - ./config:/config
+      - /path/to/comics:/comics
+      - /path/to/downloads:/downloads
+```
+
+```sh
+docker compose up -d
+```
+
+Podman: the same file with `podman-compose up -d`.
+
+### Ports & data
+
+| | |
+|---|---|
+| Default port | `8090` |
+| Upstream | <https://github.com/mylar3/mylar3> |
+| Operator notes | [mylar3.md](docs/mylar3.md) |
+
+
+### Backup & restore
+
+Back up the config/data volume(s) above — that's the whole service state (stop the container first for a clean copy). Restore by putting them back and starting it.
+
+> With orca this is **`service.backup` / `service.restore`** — location-agnostic (docker / podman / lxc / vm), one command regardless of where mylar3 runs. No per-service backup script.
+
+## With orca
+
+orca drives this plugin through the single generic `service.*` surface — no per-plugin tools:
+
+```sh
+orca service.deploy mylar3      # render + launch on any supported runtime
+orca service.status mylar3      # health + rich diagnostics (typed payload)
+orca service.backup mylar3      # location-agnostic backup (tar; PBS on Proxmox)
+orca service.configure mylar3   # apply config via the upstream API
+```
+
+## Layout
+
+- `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor + `configure` / `status`.
+- `docs/` — standalone operator notes.
+- [CAPABILITIES.md](CAPABILITIES.md) — the service-backend contract checklist.
+- `assets/` — plugin icon.
