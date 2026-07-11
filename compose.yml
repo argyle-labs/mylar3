@@ -1,0 +1,30 @@
+# Mylar3 - Comics Manager
+# docs: ../../docs/services/mylar3.md
+
+services:
+  mylar3:
+    image: lscr.io/linuxserver/mylar3:${MYLAR3_IMAGE_TAG:-latest}
+    container_name: mylar3
+    environment:
+      - PUID=${PUID:-99}
+      - PGID=${PGID:-100}
+      - TZ=${TZ:-America/Denver}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "${MYLAR3_PORT:-8090}:8090"
+    volumes:
+      - ${MYLAR3_CONFIG_PATH:-/opt/appdata/mylar3}:/config
+      - ${DOWNLOADS_PATH:-/mnt/pool/downloads}:/downloads
+      - ${MEDIA_PATH:-/mnt/pool/data/media}/comics:/data/media/comics
+    networks:
+      - media
+    restart: unless-stopped
+
+networks:
+  media:
+    external: true
