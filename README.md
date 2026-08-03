@@ -4,7 +4,7 @@
 
 # mylar3
 
-Mylar3 is an automated comic book (CBR/CBZ) downloader and manager.
+Mylar3 is a comic book (CBR/CBZ) library manager and organizer.
 
 A first-party [orca](https://github.com/argyle-labs/orca) plugin (service-backend).
 
@@ -28,7 +28,6 @@ services:
     volumes:
       - ./config:/config
       - /path/to/comics:/comics
-      - /path/to/downloads:/downloads
 ```
 
 ```sh
@@ -44,7 +43,6 @@ podman run -d --name mylar3 --restart unless-stopped \
     -p 8090:8090/tcp \
     -v ./config:/config \
     -v /path/to/comics:/comics \
-    -v /path/to/downloads:/downloads \
     lscr.io/linuxserver/mylar3:latest
 ```
 

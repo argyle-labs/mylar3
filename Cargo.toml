@@ -2,7 +2,7 @@
 name = "mylar3"
 version = "0.1.0"
 edition = "2021"
-description = "Mylar3 comic book (CBR/CBZ) downloader & manager — orca service-backend"
+description = "Mylar3 comic book (CBR/CBZ) library manager — orca service-backend"
 
 [package.metadata.orca]
 category = "downloads"
