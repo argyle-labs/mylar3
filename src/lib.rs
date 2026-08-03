@@ -1,4 +1,4 @@
-//! mylar3 service backend — Mylar3 comic book (CBR/CBZ) downloader & manager.
+//! mylar3 service backend — Mylar3 comic book (CBR/CBZ) library manager.
 //!
 //! Implements `ServiceBackend` so the generic `service.*` tools
 //! (deploy/backup/restore/configure/status/connect/sync) drive mylar3. No

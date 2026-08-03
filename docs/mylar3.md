@@ -1,20 +1,19 @@
 # Mylar3
 
-Comics manager. Monitors and downloads comic issues, integrates with Prowlarr for indexer searching.
+Comics library manager. Monitors and organizes your comic library.
 
-- **Host**: <host> (<ip>)
 - **Port**: 8090
-- **Image**: `lscr.io/linuxserver/mylar3`
-- **Compose**: [compose/mylar3/docker-compose.yml](../../compose/mylar3/docker-compose.yml)
-- **Network**: `media`
+- **Image**: `lscr.io/linuxserver/mylar3:latest`
+- **Compose**: [compose.yml](../compose.yml)
+- **Upstream**: <https://github.com/mylar3/mylar3>
 
 ## Notes
 
-- Prowlarr integration: add Mylar3 as an app in Prowlarr → Settings → Apps
-- Comics stored at `/mnt/<host>/data/media/comics`
-- Kapowarr also runs on <host> — Kapowarr focuses on ComicVine/manga; Mylar3 has stronger Prowlarr integration for western comics. Run both and use whichever fits each title better.
-- Readarr (books) was retired June 2025 — LazyLibrarian covers books/ebooks instead
+- Comics are stored on the volume mounted into the container (see `compose.yml`) — point it at wherever your comic library lives.
+- The web UI is served on port `8090` by default.
 
 ## Port conflict note
 
-Default mylar3 port (8090) conflicts with qbittorrent (8090). Set `MYLAR3_PORT` to a different port (e.g. `8091`) in Portainer stack env vars.
+If another service on the host already listens on `8090`, mylar3 will fail to
+bind. Map it to a free host port instead — e.g. `-p 8091:8090/tcp` (or the
+equivalent `ports:` entry in `compose.yml`).
