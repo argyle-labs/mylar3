@@ -163,14 +163,16 @@ impl Mylar {
     ) -> Result<T> {
         let json = match self.api_raw(cmd, params).await? {
             ResponseBody::Json { json } => json,
-            ResponseBody::Text { text } => bail!("mylar {cmd}: non-JSON reply: {}", clip(&text)),
+            ResponseBody::Text { text } => {
+                bail!("mylar {cmd}: non-JSON reply: {}", clip(&self.redact(&text)))
+            }
         };
         if json.get("success").is_some() {
             let env: Envelope<T> =
                 serde_json::from_value(json).map_err(|e| anyhow!("decode mylar {cmd}: {e}"))?;
             if env.success != Some(true) {
                 let msg = env.error.map(|e| e.message).unwrap_or_default();
-                bail!("mylar {cmd} refused: {msg}");
+                bail!("mylar {cmd} refused: {}", self.redact(&msg));
             }
             return env
                 .data
@@ -210,7 +212,7 @@ impl Mylar {
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.as_str())
                 {
-                    bail!("mylar forceProcess refused: {msg}");
+                    bail!("mylar forceProcess refused: {}", self.redact(msg));
                 }
                 json.as_str()
                     .map(str::to_string)
@@ -218,7 +220,10 @@ impl Mylar {
             }
         };
         if !text.starts_with("Successfully submitted") {
-            bail!("mylar forceProcess did not queue: {}", clip(&text));
+            bail!(
+                "mylar forceProcess did not queue: {}",
+                clip(&self.redact(&text))
+            );
         }
         Ok(text)
     }
@@ -281,11 +286,11 @@ impl Mylar {
             ResponseBody::Text { text } if text.trim().is_empty() => Ok(()),
             ResponseBody::Text { text } => bail!(
                 "mylar /configUpdate: unexpected reply: {}",
-                self.redact(&clip(&text))
+                clip(&self.redact(&text))
             ),
             ResponseBody::Json { json } => bail!(
                 "mylar /configUpdate: unexpected reply: {}",
-                self.redact(&clip(&json.to_string()))
+                clip(&self.redact(&json.to_string()))
             ),
         }
     }
@@ -499,6 +504,28 @@ mod tests {
         assert!(!err.contains("hunter2"), "{err}");
         let err = format!("{:#}", m.config_update(vec![]).await.unwrap_err());
         assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn reply_text_is_redacted() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api"))
+            .and(query_param("cmd", "getIndex"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("bad key KEY"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api"))
+            .and(query_param("cmd", "forceProcess"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("?apikey=KEY failed"))
+            .mount(&server)
+            .await;
+        let m = client(&server);
+        let err = m.index().await.unwrap_err().to_string();
+        assert!(err.contains("bad key ***") && !err.contains("KEY"), "{err}");
+        let err = m.force_process("/d").await.unwrap_err().to_string();
+        assert!(!err.contains("KEY"), "{err}");
     }
 
     #[test]

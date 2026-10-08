@@ -6,6 +6,7 @@ use plugin_toolkit::scrub;
 use plugin_toolkit::time::Timestamp;
 
 use crate::api::{ConfigIni, Mylar};
+use crate::definitions::CONFIG_KEYS;
 use crate::status;
 
 /// `checked_configs` in Mylar's `configUpdate` (`mylar/webserve.py`): the form's
@@ -103,10 +104,6 @@ const FORM_CHECKBOXES: &[&str] = &[
     "ddl_prefer_upscaled",
     "deluge_pause",
 ];
-
-/// Checkboxes other Mylar branches add to `checked_configs` (python3-dev). One
-/// present means the running form is not the one [`FORM_CHECKBOXES`] describes.
-const FOREIGN_CHECKBOXES: &[&str] = &["enable_airdcpp", "jd2_enable", "keep_html_cache"];
 
 /// Provider lists `configUpdate` rebuilds from posted `<prefix>_<field><id>` rows
 /// and empties when none are posted. Field order is Mylar's stored tuple order.
@@ -241,15 +238,18 @@ pub fn form(ini: &ConfigIni, changes: &[SettingChange]) -> Result<Vec<(String, S
             missing.join(", ")
         );
     }
-    let foreign: Vec<&str> = FOREIGN_CHECKBOXES
-        .iter()
-        .copied()
-        .filter(|k| ini.has(k))
+    // A key outside v0.8.3's definitions may be a checkbox another version's
+    // form has, which this re-post would turn off; a stale legacy key also trips this.
+    let unknown: Vec<&str> = ini
+        .0
+        .keys()
+        .map(String::as_str)
+        .filter(|k| CONFIG_KEYS.binary_search(k).is_err())
         .collect();
-    if !foreign.is_empty() {
+    if !unknown.is_empty() {
         bail!(
-            "this Mylar has form checkboxes [{}] this tool does not re-post; its version does not match",
-            foreign.join(", ")
+            "this Mylar's settings hold keys mylar3 v0.8.3 does not define [{}]; its form may differ from the one this tool re-posts",
+            unknown.join(", ")
         );
     }
     let mut fields: Vec<(String, String)> = changes
@@ -279,9 +279,9 @@ pub fn form(ini: &ConfigIni, changes: &[SettingChange]) -> Result<Vec<(String, S
             if !ids.insert(id) {
                 bail!("{ini_key} has two provider rows with id {id}; refusing to re-post it");
             }
-            // configUpdate drops a row with neither name nor host.
-            if row[0].is_empty() && row[1].is_empty() {
-                bail!("{ini_key} provider {id} has no name or host; re-posting would delete it");
+            // configUpdate renames a nameless row after its host, or drops it.
+            if row[0].is_empty() {
+                bail!("{ini_key} provider {id} has no name; re-posting would rename or delete it");
             }
             for (column, value) in columns.iter().zip(row) {
                 fields.push((format!("{prefix}_{column}{id}"), value.to_string()));
@@ -295,15 +295,16 @@ pub fn form(ini: &ConfigIni, changes: &[SettingChange]) -> Result<Vec<(String, S
 }
 
 /// Values compare by plaintext: an encrypted value is re-salted on every save.
-fn normalized(v: &str) -> std::borrow::Cow<'_, str> {
+fn normalized(v: &str) -> std::borrow::Cow<'_, [u8]> {
     let Some(b64) = v.strip_prefix(ENCRYPTED_PREFIX) else {
-        return v.into();
+        return v.as_bytes().into();
     };
     match base64_decode(b64) {
-        Some(bytes) if bytes.len() >= 8 => String::from_utf8_lossy(&bytes[..bytes.len() - 8])
-            .into_owned()
-            .into(),
-        _ => v.into(),
+        Some(mut bytes) if bytes.len() >= 8 => {
+            bytes.truncate(bytes.len() - 8);
+            bytes.into()
+        }
+        _ => v.as_bytes().into(),
     }
 }
 
@@ -439,11 +440,25 @@ pub async fn configure(
             .filter(|k| shown(k, &report.changes))
             .map(|k| format!("{k}={}", before.0.get(k).map_or("unset", String::as_str)))
             .collect();
+        let mut parts = Vec::new();
+        if !missed.is_empty() {
+            parts.push(format!("[{}] still drift", missed.join(", ")));
+        }
+        if !side_effects.is_empty() {
+            parts.push(format!(
+                "other settings moved: [{}]",
+                side_effects.join(", ")
+            ));
+        }
+        if !prior.is_empty() {
+            parts.push(format!(
+                "prior values to restore by hand: [{}]",
+                prior.join(", ")
+            ));
+        }
         bail!(
-            "mylar3.configure submitted the settings form, but [{}] still drift and other settings moved: [{}]; prior values to restore by hand: [{}]",
-            missed.join(", "),
-            side_effects.join(", "),
-            prior.join(", ")
+            "mylar3.configure submitted the settings form, but {}",
+            parts.join("; ")
         );
     }
     report.verified = true;
@@ -509,7 +524,8 @@ pub fn check_folder(ini: &ConfigIni, folder: &str) -> Result<(String, String)> {
         .filter_map(|k| ini.get(k).map(|v| (k, v)))
         .collect();
     for (key, root) in &roots {
-        if components(root).is_some_and(|r| parts.starts_with(&r)) {
+        // A root of `/` has no components and would contain every path.
+        if components(root).is_some_and(|r| !r.is_empty() && parts.starts_with(&r)) {
             return Ok((resolved, format!("{key} {root}")));
         }
     }
@@ -811,6 +827,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("[usenet_retention] still drift"), "{err}");
+        assert!(
+            !err.contains("[]") && !err.contains("other settings"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -901,9 +921,12 @@ mod tests {
         let err = form(&ini(&rows), &c).unwrap_err().to_string();
         assert!(err.contains("deluge_pause"), "{err}");
 
-        let rows = table(&[("jd2_enable", "False")]);
+        let rows = table(&[("jd2_enable", "False"), ("nzbsu_apikey", "x")]);
         let err = form(&ini(&rows), &c).unwrap_err().to_string();
-        assert!(err.contains("jd2_enable"), "{err}");
+        assert!(err.contains("[jd2_enable, nzbsu_apikey]"), "{err}");
+        assert!(FORM_CHECKBOXES
+            .iter()
+            .all(|k| CONFIG_KEYS.binary_search(k).is_ok()));
 
         let mut rows = table(&[]);
         unset(&mut rows, "minimal_ini");
@@ -937,7 +960,8 @@ mod tests {
             "a, http://a, 0, k, , 1, 3, b, http://b, 0, k, , 1, 3",
         );
         assert!(err.contains("two provider rows with id 3"), "{err}");
-        assert!(refuse("extra_newznabs", ", , 0, k, , 1, 3").contains("no name or host"));
+        assert!(refuse("extra_newznabs", ", , 0, k, , 1, 3").contains("no name"));
+        assert!(refuse("extra_newznabs", ", http://a, 0, k, , 1, 3").contains("no name"));
         let err = refuse(
             "extra_newznabs",
             "a, http://a, 0, ^~$z$S0VZMXNhbHRzYWx0, , 1, 3",
@@ -993,6 +1017,10 @@ mod tests {
         let before = ini(&table(&[("sab_apikey", "^~$z$S0VZMXNhbHRzYWx0")]));
         let resalted = ini(&table(&[("sab_apikey", "^~$z$S0VZMXBlcHBlcjEy")]));
         assert!(diff(&before, &resalted, &[]).is_empty());
+        // Non-UTF-8 plaintexts that a lossy decode would render identically.
+        let a = ini(&table(&[("sab_apikey", "^~$z$/3NhbHRzYWx0")]));
+        let b = ini(&table(&[("sab_apikey", "^~$z$/nNhbHRzYWx0")]));
+        assert_eq!(diff(&a, &b, &[]).len(), 1);
         let rekeyed = ini(&table(&[("sab_apikey", "^~$z$S0VZMnNhbHRzYWx0")]));
         assert_eq!(
             diff(&before, &rekeyed, &[]),
@@ -1054,6 +1082,9 @@ mod tests {
         assert!(check_folder(&ini(&lib), "/data/comics").is_err());
         assert!(check_folder(&ini(&lib), "/data").is_err());
         assert!(check_folder(&ini(&lib), "/data/complete").is_ok());
+
+        let slash = table(&[("sab_directory", "/"), ("check_folder", "None")]);
+        assert!(check_folder(&ini(&slash), "/downloads/complete").is_err());
 
         let mut no_dest = table(&[]);
         unset(&mut no_dest, "destination_dir");

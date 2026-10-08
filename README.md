@@ -90,13 +90,16 @@ orca mylar3.backlog.process --name comics --folder /downloads/completed/comics -
 Mylar has no per-setting write: `mylar3.configure --execute` submits the web
 settings form with every checkbox and newznab/torznab provider re-posted at its
 current value. It refuses when this Mylar's form does not match the one it
-knows (missing or extra checkboxes, `minimal_ini` not False), fails if the
-settings changed since the plan, and fails, listing what moved, if anything
-besides the planned changes moved on write. Without `--usenet-retention` it only
+knows (missing checkboxes or keys v0.8.3 does not define, `minimal_ini` not
+False), fails if the settings changed since the plan, and fails, listing what
+moved, if anything besides the planned changes moved on write. Without `--usenet-retention` it only
 raises retention below 6000. `backlog.process` only accepts a folder inside
-`sab_directory` or `check_folder` and clear of the library. Reading settings
-needs `web_username`/`web_password` when the web UI uses basic auth; forms login
-is not supported.
+`sab_directory` or `check_folder` and clear of the library.
+
+`status`, `configure` and `backlog.process` all read Mylar's settings from the
+web UI's `/getConfig`, so when the web UI uses basic auth the endpoint needs
+`web_username`/`web_password`, and forms login is not supported: `configure` and
+`backlog.process` refuse, and `status` reports the settings as unknown.
 
 ## Layout
 

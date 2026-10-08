@@ -7,6 +7,7 @@
 #![allow(clippy::disallowed_types)]
 
 pub mod api;
+mod definitions;
 pub mod execute;
 pub mod remediate;
 pub mod status;
