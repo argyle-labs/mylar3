@@ -1,10 +1,17 @@
 //! mylar3 service backend — Mylar3 comic book (CBR/CBZ) library manager.
 //!
 //! Implements `ServiceBackend` so the generic `service.*` tools
-//! (deploy/backup/restore/configure/status/connect/sync) drive mylar3. No
-//! `#[orca_tool]`s — the only orca dep is `plugin-toolkit`. Modeled on the
-//! nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
+//! (deploy/backup/restore/configure/status/connect/sync) drive mylar3,
+//! alongside the `mylar3.` detect + remediate tools in [`tools`]. The only orca
+//! dep is `plugin-toolkit`. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
+
+pub mod api;
+mod definitions;
+pub mod execute;
+pub mod remediate;
+pub mod status;
+pub mod tools;
 
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
@@ -70,23 +77,49 @@ impl ServiceBackend for Mylar3Backend {
         Box::pin(async move { Err(ServiceError::unimplemented("mylar3.workload_spec")) })
     }
 
+    /// Settings changes go through `mylar3.configure`, which is admin-only and
+    /// dry-run by default; this opaque-string entry point has neither.
     fn configure<'a>(
         &'a self,
         _instance: &'a str,
         _routes: &'a Routes,
         _config: &'a str,
     ) -> BoxFuture<'a, Result<(), ServiceError>> {
-        // TODO: apply mylar3-specific config idempotently.
-        Box::pin(async move { Err(ServiceError::unimplemented("mylar3.configure")) })
+        Box::pin(async move {
+            Err(ServiceError::Other(
+                "mylar3 settings are planned by `mylar3.configure` (admin, dry run by default)"
+                    .into(),
+            ))
+        })
     }
 
+    /// The `mylar3.status` report for the endpoint named `instance`, reduced to
+    /// health plus its findings; `ServiceInfo` has no mylar3 variant.
     fn status<'a>(
         &'a self,
-        _instance: &'a str,
+        instance: &'a str,
         _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<ServiceStatus, ServiceError>> {
-        // TODO: real health/diagnostics.
-        Box::pin(async move { Err(ServiceError::unimplemented("mylar3.status")) })
+        Box::pin(async move {
+            let m = tools::connect(instance)
+                .await
+                .map_err(|e| ServiceError::Other(format!("{e:#}")))?;
+            let s = status::status(instance, &m, tools::DEFAULT_STUCK_HOURS)
+                .await
+                .map_err(|e| ServiceError::Transport(format!("{e:#}")))?;
+            let mut detail = s.findings.join("; ");
+            if let Some(e) = &s.config_error {
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                detail.push_str(&format!("settings unknown: {e}"));
+            }
+            Ok(ServiceStatus {
+                healthy: s.healthy,
+                detail,
+                ..Default::default()
+            })
+        })
     }
 }
 

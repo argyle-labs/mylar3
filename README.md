@@ -69,18 +69,41 @@ Back up the config/data volume(s) above — that's the whole service state (stop
 
 ## With orca
 
-orca drives this plugin through the single generic `service.*` surface — no per-plugin tools:
+orca drives this plugin through the generic `service.*` surface:
 
 ```sh
 orca service.deploy mylar3      # render + launch on any supported runtime
 orca service.status mylar3      # health + rich diagnostics (typed payload)
 orca service.backup mylar3      # location-agnostic backup (tar; PBS on Proxmox)
-orca service.configure mylar3   # apply config via the upstream API
+orca service.configure mylar3   # refuses; settings go through mylar3.configure
 ```
+
+plus detect + remediate tools against a registered endpoint (`mylar3.create`):
+
+```sh
+orca mylar3.status --name comics                      # findings: retention, post-processing, stuck grabs, torrents
+orca mylar3.configure --name comics                   # dry run: reports settings drift
+orca mylar3.configure --name comics --usenet-retention 6000 --execute
+orca mylar3.backlog.process --name comics --folder /downloads/completed/comics --execute
+```
+
+Mylar has no per-setting write: `mylar3.configure --execute` submits the web
+settings form with every checkbox and newznab/torznab provider re-posted at its
+current value. It refuses when this Mylar's form does not match the one it
+knows (missing checkboxes or keys v0.8.3 does not define, `minimal_ini` not
+False), fails if the settings changed since the plan, and fails, listing what
+moved, if anything besides the planned changes moved on write. Without `--usenet-retention` it only
+raises retention below 6000. `backlog.process` only accepts a folder inside
+`sab_directory` or `check_folder` and clear of the library.
+
+`status`, `configure` and `backlog.process` all read Mylar's settings from the
+web UI's `/getConfig`, so when the web UI uses basic auth the endpoint needs
+`web_username`/`web_password`, and forms login is not supported: `configure` and
+`backlog.process` refuse, and `status` reports the settings as unknown.
 
 ## Layout
 
-- `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor + `configure` / `status`.
+- `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor + the `mylar3.` detect/remediate tools.
 - `docs/` — standalone operator notes.
 - [CAPABILITIES.md](CAPABILITIES.md) — the service-backend contract checklist.
 - `assets/` — plugin icon.
