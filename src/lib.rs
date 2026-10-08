@@ -93,7 +93,7 @@ impl ServiceBackend for Mylar3Backend {
     }
 
     /// The `mylar3.status` report for the endpoint named `instance`, reduced to
-    /// health plus its findings; `ServiceInfo` has no mylar3 variant yet.
+    /// health plus its findings; `ServiceInfo` has no mylar3 variant.
     fn status<'a>(
         &'a self,
         instance: &'a str,
@@ -103,7 +103,7 @@ impl ServiceBackend for Mylar3Backend {
             let m = tools::connect(instance)
                 .await
                 .map_err(|e| ServiceError::Other(format!("{e:#}")))?;
-            let s = status::status(instance, &m, 24)
+            let s = status::status(instance, &m, tools::DEFAULT_STUCK_HOURS)
                 .await
                 .map_err(|e| ServiceError::Transport(format!("{e:#}")))?;
             let mut detail = s.findings.join("; ");

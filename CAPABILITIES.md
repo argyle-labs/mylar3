@@ -17,7 +17,7 @@ generic `service.*` surface. Runtimes: **docker,podman,lxc**.
 - [x] endpoint registry `mylar3.{list,detail,create,update,delete}` — routes + api_key (secret) + web login (password secret)
 - [x] `status` — usenet retention vs oldest Wanted issue, completed-download handling, issues stuck at Snatched, search delay, torrent search without a client
 - [x] `configure` — converge `usenet_retention` (and `nzb_downloader` when SABnzbd is set but unused) through the web settings form; dry run by default
-- [x] `backlog.process` — queue Mylar's post-processor over a completed-downloads folder; dry run by default
+- [x] `backlog.process` — queue Mylar's post-processor over a folder inside `sab_directory`/`check_folder`, clear of the library; dry run by default
 
 ## Provided generically by orca (NO code here)
 - `deploy` — `service.deploy` → `deploy_target.launch(WorkloadSpec)`

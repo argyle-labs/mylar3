@@ -75,7 +75,7 @@ orca drives this plugin through the generic `service.*` surface:
 orca service.deploy mylar3      # render + launch on any supported runtime
 orca service.status mylar3      # health + rich diagnostics (typed payload)
 orca service.backup mylar3      # location-agnostic backup (tar; PBS on Proxmox)
-orca service.configure mylar3   # apply config via the upstream API
+orca service.configure mylar3   # refuses; settings go through mylar3.configure
 ```
 
 plus detect + remediate tools against a registered endpoint (`mylar3.create`):
@@ -89,9 +89,14 @@ orca mylar3.backlog.process --name comics --folder /downloads/completed/comics -
 
 Mylar has no per-setting write: `mylar3.configure --execute` submits the web
 settings form with every checkbox and newznab/torznab provider re-posted at its
-current value, then re-reads the settings and reports anything else that
-changed as `side_effects`. Reading settings needs `web_username`/`web_password`
-when the web UI uses basic auth; forms login is not supported.
+current value. It refuses when this Mylar's form does not match the one it
+knows (missing or extra checkboxes, `minimal_ini` not False), fails if the
+settings changed since the plan, and fails, listing what moved, if anything
+besides the planned changes moved on write. Without `--usenet-retention` it only
+raises retention below 6000. `backlog.process` only accepts a folder inside
+`sab_directory` or `check_folder` and clear of the library. Reading settings
+needs `web_username`/`web_password` when the web UI uses basic auth; forms login
+is not supported.
 
 ## Layout
 

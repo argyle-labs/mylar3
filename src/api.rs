@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use plugin_toolkit::http::{Client as HttpClient, HttpError, ResponseBody};
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::scrub;
 use plugin_toolkit::serde_json;
 
 pub struct Mylar {
@@ -146,7 +147,10 @@ impl Mylar {
         for (k, v) in params {
             req = req.query(*k, *v);
         }
-        let resp = req.send().await.map_err(|e| anyhow!("mylar {cmd}: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| self.transport(&format!("mylar {cmd}"), e))?;
         Ok(resp.body)
     }
 
@@ -237,19 +241,22 @@ impl Mylar {
                     "mylar /getConfig: 401 — the web UI uses basic auth; set the endpoint's \
                      web_username/web_password"
                 ),
-                e => anyhow!("mylar /getConfig: {e}"),
+                e => self.transport("mylar /getConfig", e),
             })?;
         match resp.body {
             ResponseBody::Json { json } => {
                 let table: ConfigTable = serde_json::from_value(json)
                     .map_err(|e| anyhow!("decode mylar /getConfig: {e}"))?;
-                Ok(ConfigIni(
-                    table
-                        .rows
-                        .into_iter()
-                        .map(|(k, v)| (k.to_ascii_lowercase(), v))
-                        .collect(),
-                ))
+                let mut ini = BTreeMap::new();
+                for (k, v) in table.rows {
+                    let key = k.to_ascii_lowercase();
+                    if ini.insert(key.clone(), v).is_some() {
+                        bail!(
+                            "mylar /getConfig lists '{key}' twice; refusing to guess which applies"
+                        );
+                    }
+                }
+                Ok(ConfigIni(ini))
             }
             ResponseBody::Text { .. } => bail!(
                 "mylar /getConfig returned HTML (the forms login page): the web UI uses \
@@ -259,16 +266,52 @@ impl Mylar {
         }
     }
 
-    /// Submit the web settings form (`/configUpdate`). Mylar replies with an
-    /// empty page either way; callers confirm by re-reading [`Self::config`].
+    /// Submit the web settings form (`/configUpdate`). A save answers 200 with
+    /// an empty body; anything else (an error page, the forms-login page) is a
+    /// failure. Callers confirm what landed by re-reading [`Self::config`].
     pub async fn config_update(&self, fields: Vec<(String, String)>) -> Result<()> {
-        self.http
+        let resp = self
+            .http
             .post(self.web_url("configUpdate"))
             .form(fields)
             .send()
             .await
-            .map_err(|e| anyhow!("mylar /configUpdate: {e}"))?;
-        Ok(())
+            .map_err(|e| self.transport("mylar /configUpdate", e))?;
+        match resp.body {
+            ResponseBody::Text { text } if text.trim().is_empty() => Ok(()),
+            ResponseBody::Text { text } => bail!(
+                "mylar /configUpdate: unexpected reply: {}",
+                self.redact(&clip(&text))
+            ),
+            ResponseBody::Json { json } => bail!(
+                "mylar /configUpdate: unexpected reply: {}",
+                self.redact(&clip(&json.to_string()))
+            ),
+        }
+    }
+
+    /// Transport errors carry the request URL, which holds the API key in its
+    /// query and the web login in its userinfo.
+    fn transport(&self, what: &str, e: HttpError) -> plugin_toolkit::anyhow::Error {
+        anyhow!("{what}: {}", self.redact(&e.to_string()))
+    }
+
+    fn redact(&self, msg: &str) -> String {
+        let mut secrets = vec![self.api_key.clone()];
+        if let Some((user, pass)) = &self.web_auth {
+            secrets.push(format!(
+                "{}:{}@",
+                plugin_toolkit::url::encode(user),
+                plugin_toolkit::url::encode(pass)
+            ));
+            secrets.push(pass.clone());
+        }
+        let mut out = msg.to_string();
+        for s in secrets.iter().filter(|s| !s.is_empty()) {
+            out = out.replace(s.as_str(), scrub::REDACTED_TEXT);
+            out = out.replace(&plugin_toolkit::url::encode(s), scrub::REDACTED_TEXT);
+        }
+        redact_query(&out, "apikey=")
     }
 
     fn web_url(&self, route: &str) -> String {
@@ -291,6 +334,26 @@ fn with_userinfo(base: &str, user: &str, pass: &str) -> String {
         Some((scheme, rest)) => format!("{scheme}://{creds}{rest}"),
         None => format!("{creds}{base}"),
     }
+}
+
+/// Blank every `marker` query value, for keys rendered in forms the literal
+/// replacement in [`Mylar::redact`] misses.
+fn redact_query(msg: &str, marker: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(i) = rest.find(marker) {
+        let (head, tail) = rest.split_at(i + marker.len());
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| c == '&' || c == ')' || c == '"' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        if end > 0 {
+            out.push_str(scrub::REDACTED_TEXT);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn clip(s: &str) -> String {
@@ -420,6 +483,60 @@ mod tests {
             .await
             .unwrap();
         assert!(ack.starts_with("Successfully submitted"));
+    }
+
+    #[tokio::test]
+    async fn transport_errors_hide_the_api_key_and_web_login() {
+        // Nothing listens on port 1, so reqwest fails with the URL in its error.
+        let m = Mylar::new(
+            "http://127.0.0.1:1",
+            "SECRETKEY123",
+            Some(("admin".into(), "hunter2!".into())),
+        );
+        let err = format!("{:#}", m.index().await.unwrap_err());
+        assert!(!err.contains("SECRETKEY123"), "{err}");
+        let err = format!("{:#}", m.config().await.unwrap_err());
+        assert!(!err.contains("hunter2"), "{err}");
+        let err = format!("{:#}", m.config_update(vec![]).await.unwrap_err());
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    #[test]
+    fn redact_query_blanks_every_apikey() {
+        assert_eq!(
+            redact_query("GET /api?apikey=abc&cmd=x (apikey=def)", "apikey="),
+            "GET /api?apikey=***&cmd=x (apikey=***)"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_refuses_a_key_listed_twice() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/getConfig"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "aaData": [["SAB_HOST", "a"], ["sab_host", "b"]]
+            })))
+            .mount(&server)
+            .await;
+        let err = client(&server).config().await.unwrap_err().to_string();
+        assert!(err.contains("'sab_host' twice"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn config_update_rejects_a_non_empty_reply() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/configUpdate"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>login</html>"))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .config_update(vec![("a".into(), "b".into())])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unexpected reply"), "{err}");
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub async fn connect(name: &str) -> Result<Mylar> {
     Ok(Mylar::new(&base_url, &api_key, web_auth))
 }
 
-const DEFAULT_STUCK_HOURS: u32 = 24;
+pub const DEFAULT_STUCK_HOURS: u32 = 24;
 
 #[orca_struct(args)]
 pub struct StatusArgs {
@@ -83,27 +83,26 @@ pub struct ConfigureArgs {
     /// Registered mylar3 endpoint name.
     #[arg(long)]
     pub name: String,
-    /// Days of usenet retention to advertise to indexers (newznab `maxage`).
-    /// Match the shortest retention among your news providers.
-    #[arg(long, default_value_t = remediate::DEFAULT_USENET_RETENTION)]
-    #[serde(default = "default_usenet_retention")]
-    pub usenet_retention: u32,
+    /// Days of usenet retention to advertise to indexers (newznab `maxage`),
+    /// matched exactly. Omitted, a value below 6000 is raised to 6000 and a
+    /// higher one is left alone. Match the shortest retention among your news
+    /// providers.
+    #[arg(long)]
+    #[serde(default)]
+    pub usenet_retention: Option<u32>,
     /// Apply. Omitted, reports drift and changes nothing.
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,
 }
 
-fn default_usenet_retention() -> u32 {
-    remediate::DEFAULT_USENET_RETENTION
-}
-
 /// **Fix settings drift**: `usenet_retention` against the target, and
-/// `nzb_downloader` when SABnzbd is set up but unused. Mylar's only settings
-/// writer is its all-or-nothing web form, so `execute` re-posts every checkbox
-/// and provider at its current value with the changes applied, then re-reads
-/// and reports anything else that moved as `side_effects`. Without `execute`,
-/// reports drift and changes nothing.
+/// `nzb_downloader` when SABnzbd is fully set up but unused (otherwise listed as
+/// `manual`). Mylar's only settings writer is its all-or-nothing web form, so
+/// `execute` re-posts every checkbox and provider at its current value with the
+/// changes applied, refusing when this Mylar's form does not match. It fails
+/// if the settings moved since the plan, or if anything other than the changes
+/// moved on write. Without `execute`, reports drift and changes nothing.
 #[orca_tool(
     domain = "mylar3",
     verb = "configure",
@@ -138,8 +137,10 @@ pub struct BacklogArgs {
 
 /// **Import the backlog**: queue Mylar's post-processor over `folder`
 /// (`forceProcess`, `Manual Run`), which matches every file there against the
-/// watchlist and moves hits into the library. Without `execute`, reports how
-/// many issues are stuck at Snatched and queues nothing.
+/// watchlist and moves hits into the library. `folder` must sit inside
+/// `sab_directory` or `check_folder` and clear of the library
+/// (`destination_dir`). Without `execute`, reports the checked folder and how
+/// many issues are stuck at Snatched, and queues nothing.
 #[orca_tool(
     domain = "mylar3",
     verb = "backlog.process",
@@ -151,4 +152,74 @@ async fn mylar3_backlog_process(args: BacklogArgs, ctx: &ToolCtx) -> Result<Back
     execute::require_admin(TOOL, ctx)?;
     let m = connect(&args.name).await?;
     remediate::process_backlog(&args.name, &m, &args.folder, args.stuck_hours, args.execute).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plugin_toolkit::contract::config::{Config, Model};
+    use plugin_toolkit::contract::CallerIdentity;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn ctx(role: Option<&str>) -> ToolCtx {
+        let cfg = Arc::new(Config {
+            anthropic_api_key: None,
+            lmstudio_url: String::new(),
+            ollama_url: String::new(),
+            default_model: Model::LMStudio {
+                id: String::new(),
+                url: String::new(),
+            },
+            app_dir: PathBuf::from("/nonexistent"),
+            memory_root: PathBuf::from("/nonexistent"),
+            db_path: PathBuf::from("/nonexistent/orca.db"),
+            ports: Default::default(),
+        });
+        let ctx = ToolCtx::new(cfg);
+        match role {
+            Some(role) => ctx.with_auth(CallerIdentity {
+                user_id: "u".into(),
+                username: "op".into(),
+                role: role.into(),
+                can_mutate: true,
+            }),
+            None => ctx,
+        }
+    }
+
+    // The role check runs before the endpoint lookup, so these never reach a
+    // registry or a Mylar.
+    #[tokio::test]
+    async fn configure_requires_admin_on_dry_run() {
+        for role in [Some("user"), None] {
+            let args = ConfigureArgs {
+                name: "m".into(),
+                usenet_retention: None,
+                execute: false,
+            };
+            let err = mylar3_configure(args, &ctx(role))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("mylar3.configure"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn backlog_requires_admin_on_dry_run() {
+        for role in [Some("user"), None] {
+            let args = BacklogArgs {
+                name: "m".into(),
+                folder: "/downloads/complete".into(),
+                stuck_hours: DEFAULT_STUCK_HOURS,
+                execute: false,
+            };
+            let err = mylar3_backlog_process(args, &ctx(role))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("mylar3.backlog.process"), "{err}");
+        }
+    }
 }
