@@ -11,7 +11,10 @@ mod definitions;
 pub mod execute;
 pub mod remediate;
 pub mod status;
+#[cfg(test)]
+mod testkit;
 pub mod tools;
+pub mod write;
 
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
