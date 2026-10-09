@@ -23,8 +23,9 @@ pub struct ConfigureReport {
     /// Mylar accepted the settings form.
     pub applied: bool,
     /// A re-read after the write shows every change and nothing else moved.
-    /// `/getConfig` serves Mylar's in-memory settings, so this does not prove
-    /// the `config.ini` write reached disk.
+    /// `/getConfig` lists the configparser values Mylar writes to `config.ini`,
+    /// not its in-memory settings, so this does not prove the file write
+    /// reached disk.
     pub verified: bool,
     pub dry_run: bool,
 }

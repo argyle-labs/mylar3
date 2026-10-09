@@ -712,9 +712,9 @@ fn rows_unlanded(posted: &Providers, after: &Providers) -> Vec<String> {
 /// Post `write`, planned from `before`, and confirm it. Refuses if the settings
 /// moved since `before` was read. Fails if the form is rejected, a planned
 /// value did not land, or anything else moved; the error lists what, with
-/// secret values withheld. Confirmation reads `/getConfig`, which serves
-/// Mylar's in-memory settings, so it does not prove the `config.ini` write
-/// reached disk.
+/// secret values withheld. Confirmation reads `/getConfig`, which lists the
+/// configparser values Mylar writes to `config.ini` rather than its in-memory
+/// settings, so it does not prove the file write reached disk.
 pub async fn apply(m: &Mylar, before: &ConfigIni, write: &Write) -> Result<()> {
     let fields = form(before, &write.changes, &write.providers)?;
     let fresh = m
