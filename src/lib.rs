@@ -6,6 +6,7 @@
 //! dep is `plugin-toolkit`. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
 
+pub mod acquisition;
 pub mod api;
 mod definitions;
 pub mod execute;
