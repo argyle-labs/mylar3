@@ -51,7 +51,12 @@ fn validate(e: &Edit) -> Result<(), EditError> {
     if e.section.is_empty() || breaks(&e.section) || e.section.contains(']') {
         return Err(EditError::Section(e.section.clone()));
     }
-    if e.key.trim().is_empty() || breaks(&e.key) || e.key.contains(['=', ':']) {
+    if e.key.trim().is_empty()
+        || e.key.trim() != e.key
+        || breaks(&e.key)
+        || e.key.contains(['=', ':'])
+        || e.key.starts_with(['#', ';', '['])
+    {
         return Err(EditError::Key(e.key.clone()));
     }
     // configparser strips values on read, so edge whitespace would not survive.
@@ -62,16 +67,34 @@ fn validate(e: &Edit) -> Result<(), EditError> {
 }
 
 /// The value of `key` in `[section]` as configparser reads it: trimmed,
-/// continuation lines joined with `\n`, and `%%` unescaped to `%`.
+/// continuation lines joined with `\n`, and `%%` unescaped to `%`. `None` if
+/// the value holds any other `%`, which BasicInterpolation rejects or expands.
 pub fn get(text: &str, section: &str, key: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let entry = entries(&lines)
         .into_iter()
         .find(|en| en.section == Some(section) && en.key.eq_ignore_ascii_case(key))?;
-    let first = lines[entry.line].split_once(['=', ':'])?.1.trim();
+    let first = lines[entry.line][entry.delim + 1..].trim();
     let mut value = vec![first];
-    value.extend(lines[entry.line + 1..entry.end].iter().map(|l| l.trim()));
-    Some(value.join("\n").replace("%%", "%"))
+    value.extend(
+        lines[entry.line + 1..entry.end]
+            .iter()
+            .filter(|l| !is_comment(l))
+            .map(|l| l.trim()),
+    );
+    unescape(&value.join("\n"))
+}
+
+fn unescape(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' && chars.next() != Some('%') {
+            return None;
+        }
+        out.push(c);
+    }
+    Some(out)
 }
 
 /// A `key = value` line and the lines its value spans.
@@ -79,13 +102,17 @@ struct Entry<'a> {
     section: Option<&'a str>,
     key: &'a str,
     line: usize,
+    /// Byte offset of the `=` or `:` in the key line.
+    delim: usize,
     /// One past the value's last non-blank continuation line.
     end: usize,
 }
 
-/// A `[name]` header; configparser keeps the name's inner whitespace.
+/// A `[name]` header; configparser keeps the name's inner whitespace, runs the
+/// name to the last `]`, and ignores text after it.
 fn header(line: &str) -> Option<&str> {
-    let name = line.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let rest = line.trim().strip_prefix('[')?;
+    let name = &rest[..rest.rfind(']')?];
     (!name.is_empty()).then_some(name)
 }
 
@@ -99,7 +126,8 @@ fn indent(line: &str) -> usize {
 
 /// Every entry in `lines`, read with configparser's defaults. A non-blank line
 /// indented deeper than the key line continues the value, even across blank
-/// lines (`empty_lines_in_values`); a comment ends it.
+/// and comment lines (`empty_lines_in_values`); comments are skipped, not part
+/// of the value.
 fn entries<'a>(lines: &[&'a str]) -> Vec<Entry<'a>> {
     let mut out: Vec<Entry<'a>> = Vec::new();
     let mut section = None;
@@ -110,7 +138,6 @@ fn entries<'a>(lines: &[&'a str]) -> Vec<Entry<'a>> {
             continue;
         }
         if is_comment(line) {
-            open = None;
             continue;
         }
         if let Some(at) = open {
@@ -126,12 +153,13 @@ fn entries<'a>(lines: &[&'a str]) -> Vec<Entry<'a>> {
             section = Some(name);
             continue;
         }
-        if let Some((k, _)) = line.split_once(['=', ':']) {
+        if let Some(delim) = line.find(['=', ':']) {
             open = Some(indent(line));
             out.push(Entry {
                 section,
-                key: k.trim(),
+                key: line[..delim].trim(),
                 line: i,
+                delim,
                 end: i + 1,
             });
         }
@@ -156,7 +184,7 @@ fn apply(text: &str, e: &Edit) -> String {
     {
         let line = lines[en.line];
         let body = line.trim_end_matches(['\r', '\n']);
-        let pos = body.find(['=', ':']).unwrap_or(body.len() - 1);
+        let pos = en.delim;
         let after = &body[pos + 1..];
         let mut gap = &after[..after.len() - after.trim_start().len()];
         if gap.is_empty() && !value.is_empty() && body[..pos].ends_with([' ', '\t']) {
@@ -391,6 +419,11 @@ mod tests {
             (edit("General", "a=b", "v"), EditError::Key("a=b".into())),
             (edit("General", "a:b", "v"), EditError::Key("a:b".into())),
             (edit("General", "k\r", "v"), EditError::Key("k\r".into())),
+            (edit("General", " k", "v"), EditError::Key(" k".into())),
+            (edit("General", "k\t", "v"), EditError::Key("k\t".into())),
+            (edit("General", "#k", "v"), EditError::Key("#k".into())),
+            (edit("General", ";k", "v"), EditError::Key(";k".into())),
+            (edit("General", "[k", "v"), EditError::Key("[k".into())),
             (
                 edit("General", "k", "a\nb"),
                 EditError::Value("a\nb".into()),
@@ -436,10 +469,36 @@ mod tests {
     }
 
     #[test]
-    fn a_comment_ends_a_multiline_value() {
+    fn a_comment_does_not_end_a_multiline_value() {
         let text = "[General]\nnotes = a\n  # c\n  b = 2\n";
-        assert_eq!(get(text, "General", "notes").as_deref(), Some("a"));
-        assert_eq!(get(text, "General", "b").as_deref(), Some("2"));
+        assert_eq!(get(text, "General", "notes").as_deref(), Some("a\nb = 2"));
+        assert_eq!(get(text, "General", "b"), None);
+        assert_eq!(
+            rw(text, &[edit("General", "notes", "z")]),
+            "[General]\nnotes = z\n"
+        );
+        let text = "[General]\nnotes = a\n# c\n  b\n# trailing\nk = 1\n";
+        assert_eq!(get(text, "General", "notes").as_deref(), Some("a\nb"));
+        assert_eq!(
+            rw(text, &[edit("General", "notes", "z")]),
+            "[General]\nnotes = z\n# trailing\nk = 1\n"
+        );
+    }
+
+    #[test]
+    fn get_rejects_percent_other_than_escaped() {
+        let at = |v: &str| get(&format!("[G]\nk = {v}\n"), "G", "k");
+        assert_eq!(at("50%%").as_deref(), Some("50%"));
+        assert_eq!(at("%%%%").as_deref(), Some("%%"));
+        assert_eq!(at("50%"), None);
+        assert_eq!(at("%(x)s"), None);
+        assert_eq!(at("%%%"), None);
+    }
+
+    #[test]
+    fn headers_run_to_the_last_bracket_and_ignore_trailing_text() {
+        assert_eq!(get("[A] junk\nx = 1\n", "A", "x").as_deref(), Some("1"));
+        assert_eq!(get("[A]x]\nx = 1\n", "A]x", "x").as_deref(), Some("1"));
     }
 
     #[test]
