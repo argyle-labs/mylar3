@@ -130,8 +130,10 @@ pub fn is_secret(key: &str) -> bool {
     scrub::is_sensitive_key(key) || MYLAR_SECRETS.contains(&key)
 }
 
-#[orca_struct]
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Debug and Serialize redact a secret key's values, as [`SettingChange::redacted`].
+#[derive(Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
 pub struct SettingChange {
     /// `config.ini` key.
     pub key: String,
@@ -153,6 +155,42 @@ impl SettingChange {
             target: scrub::REDACTED.to_string(),
             reason: self.reason.clone(),
         }
+    }
+}
+
+impl std::fmt::Debug for SettingChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = self.redacted();
+        f.debug_struct("SettingChange")
+            .field("key", &r.key)
+            .field("current", &r.current)
+            .field("target", &r.target)
+            .field("reason", &r.reason)
+            .finish()
+    }
+}
+
+impl Serialize for SettingChange {
+    fn serialize<S: plugin_toolkit::serde::Serializer>(
+        &self,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(crate = "plugin_toolkit::serde")]
+        struct Shown<'a> {
+            key: &'a str,
+            current: Option<&'a str>,
+            target: &'a str,
+            reason: &'a str,
+        }
+        let r = self.redacted();
+        Shown {
+            key: &r.key,
+            current: r.current.as_deref(),
+            target: &r.target,
+            reason: &r.reason,
+        }
+        .serialize(s)
     }
 }
 
@@ -190,7 +228,7 @@ impl ProviderKind {
 }
 
 /// One indexer row, in Mylar's stored tuple order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderRow {
     pub name: String,
     pub host: String,
@@ -203,6 +241,20 @@ pub struct ProviderRow {
     pub enabled: String,
     /// `None` for a new row; Mylar numbers it on save.
     pub id: Option<u32>,
+}
+
+impl std::fmt::Debug for ProviderRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderRow")
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("verify", &self.verify)
+            .field("apikey", &scrub::REDACTED)
+            .field("extra", &self.extra)
+            .field("enabled", &self.enabled)
+            .field("id", &self.id)
+            .finish()
+    }
 }
 
 impl ProviderRow {
@@ -444,8 +496,10 @@ fn bool_word(v: &str) -> Option<&'static str> {
     }
 }
 
-/// The value Mylar stores for `key` posted as `target`: `process_kwargs`'
-/// type coercion, then the rewrites `config.configure()` applies on every save.
+/// `key`'s value as Mylar uses it: `process_kwargs`' type coercion, then the
+/// rewrites `config.configure()` applies on every save. Most rewrites stay in
+/// memory while `config.ini` (and `/getConfig`) keep the posted text, so saved
+/// and target values compare through this on both sides.
 pub fn stored_form(key: &str, target: &str) -> String {
     let mut v = target.to_string();
     if BOOL_KEYS.binary_search(&key).is_ok() {
@@ -491,9 +545,15 @@ pub fn stored_form(key: &str, target: &str) -> String {
     v
 }
 
-/// Whether `ini` already stores `key` as Mylar would store `target`.
+/// Whether `ini` already holds a value for `key` equivalent to `target`.
 pub fn is_stored(ini: &ConfigIni, key: &str, target: &str) -> bool {
-    ini.0.get(key).map(|v| normalized(v)) == Some(normalized(&stored_form(key, target)))
+    ini.0
+        .get(key)
+        .is_some_and(|v| canonical(key, v) == canonical(key, target))
+}
+
+fn canonical(key: &str, v: &str) -> Vec<u8> {
+    normalized(&stored_form(key, v)).into_owned()
 }
 
 /// Values compare by plaintext: an encrypted value is re-salted on every save.
@@ -547,7 +607,7 @@ fn changed<'a>(before: &'a ConfigIni, after: &'a ConfigIni, planned: &[&str]) ->
         .map(String::as_str)
         .filter(|k| !planned.contains(k))
         .filter(|k| {
-            before.0.get(*k).map(|v| normalized(v)) != after.0.get(*k).map(|v| normalized(v))
+            before.0.get(*k).map(|v| canonical(k, v)) != after.0.get(*k).map(|v| canonical(k, v))
         })
         .collect()
 }
@@ -568,7 +628,7 @@ pub(crate) fn diff(before: &ConfigIni, after: &ConfigIni, planned: &[&str]) -> V
         .collect()
 }
 
-/// Planned keys whose stored value is not [`stored_form`] of the target.
+/// Planned keys whose saved value is not equivalent to the target.
 fn unlanded(after: &ConfigIni, changes: &[SettingChange]) -> Vec<String> {
     changes
         .iter()
@@ -636,12 +696,109 @@ fn rows_unlanded(posted: &Providers, after: &Providers) -> Vec<String> {
     out
 }
 
+/// The `provider_order` values `provider_sequence()` (`mylar/config.py`) may
+/// write when `changes` and `providers` are saved over `before`; it runs on
+/// every save. Empty when the saved order cannot be read, as Mylar would fail.
+fn provider_orders(
+    before: &ConfigIni,
+    changes: &[SettingChange],
+    providers: &Providers,
+) -> Vec<String> {
+    let on = |key: &str| match changes.iter().find(|c| c.key == key) {
+        Some(c) => stored_form(key, &c.target) == "True",
+        None => before.flag(key) == Some(true),
+    };
+    let mut enabled: Vec<String> = Vec::new();
+    if on("enable_torrent_search") && on("enable_32p") {
+        enabled.push("32p".into());
+    }
+    if on("experimental") {
+        enabled.push("Experimental".into());
+    }
+    if on("enable_ddl") {
+        if on("enable_getcomics") {
+            enabled.push("DDL(GetComics)".into());
+        }
+        if on("enable_external_server") {
+            enabled.push("DDL(External)".into());
+        }
+    }
+    // Every name an existing order is matched against; 32p is not one, so it
+    // drops out of any order already saved.
+    let mut known: Vec<String> = ["Experimental", "DDL(GetComics)", "DDL(External)"]
+        .map(String::from)
+        .to_vec();
+    for (kind, active) in [
+        (ProviderKind::Newznab, on("newznab")),
+        (
+            ProviderKind::Torznab,
+            on("enable_torznab") && on("enable_torrent_search"),
+        ),
+    ] {
+        if !active {
+            continue;
+        }
+        for row in providers.list(kind).iter().filter(|r| r.enabled == "1") {
+            let name = if row.name.ends_with('"') {
+                row.name.replace('"', "").trim().to_string()
+            } else {
+                row.name.clone()
+            };
+            enabled.push(name.clone());
+            known.push(name);
+        }
+    }
+    let join = |names: Vec<&String>| {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("{i}, {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // Survivors keep their saved rank; new names rank after all of them,
+    // in reverse (Mylar walks the list backwards and sorts stably).
+    let reorder = |saved: &[(&str, &str)]| -> Option<String> {
+        let mut ranked = Vec::new();
+        for name in enabled.iter().rev().filter(|n| known.contains(n)) {
+            let rank = match saved
+                .iter()
+                .find(|(_, s)| s.to_lowercase() == name.to_lowercase())
+            {
+                Some((seq, _)) => seq.trim().parse::<i64>().ok()?,
+                None => enabled.len() as i64,
+            };
+            ranked.push((rank, name));
+        }
+        ranked.sort_by_key(|(rank, _)| *rank);
+        Some(join(ranked.into_iter().map(|(_, n)| n).collect()))
+    };
+    match before.get("provider_order") {
+        Some(saved) => {
+            let parts: Vec<&str> = saved.split(", ").collect();
+            let pairs: Vec<(&str, &str)> = parts
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[seq, name]| (*seq, *name))
+                .collect();
+            reorder(&pairs).into_iter().collect()
+        }
+        // An unset order is None in memory until a save, then an empty map.
+        None => {
+            let mut out = vec![join(enabled.iter().collect())];
+            out.extend(reorder(&[]));
+            out
+        }
+    }
+}
+
 /// Post `write`, planned from `before`, and confirm it. Refuses if the settings
 /// moved since `before` was read. Fails if the form is rejected, a planned
 /// value did not land, or anything else moved; the error lists what, with
-/// secret values withheld. Confirmation reads `/getConfig`, which serves
-/// Mylar's in-memory settings, so it does not prove the `config.ini` write
-/// reached disk.
+/// secret values withheld. Confirmation reads `/getConfig`, which lists the
+/// configparser values Mylar writes to `config.ini` rather than its in-memory
+/// settings, so it does not prove the file write reached disk.
 pub async fn apply(m: &Mylar, before: &ConfigIni, write: &Write) -> Result<()> {
     let fields = form(before, &write.changes, &write.providers)?;
     let fresh = m
@@ -671,17 +828,28 @@ pub async fn apply(m: &Mylar, before: &ConfigIni, write: &Write) -> Result<()> {
         .config()
         .await
         .context("settings were submitted; re-read to verify failed")?;
-    let missed = unlanded(&after, &write.changes);
+    let mut missed = unlanded(&after, &write.changes);
     let rows = match Providers::parse(&after) {
         Ok(got) => rows_unlanded(&write.providers, &got),
         Err(e) => vec![format!("indexer rows unreadable after the write: {e}")],
     };
-    let planned: Vec<&str> = write
+    let mut planned: Vec<&str> = write
         .changes
         .iter()
         .map(|c| c.key.as_str())
         .chain(ProviderKind::ALL.iter().map(|k| k.ini_key()))
         .collect();
+    let orders = provider_orders(before, &write.changes, &write.providers);
+    if !orders.is_empty() {
+        planned.push("provider_order");
+        let got = after.get("provider_order").unwrap_or_default();
+        if !orders.iter().any(|o| o == got) {
+            missed.push(format!(
+                "provider_order: wanted {}, Mylar stored {got}",
+                orders.join(" or ")
+            ));
+        }
+    }
     let side_effects = diff(before, &after, &planned);
     if missed.is_empty() && rows.is_empty() && side_effects.is_empty() {
         return Ok(());
@@ -927,6 +1095,62 @@ mod tests {
     }
 
     #[test]
+    fn debug_and_serialize_withhold_secrets() {
+        let c = SettingChange {
+            key: "sab_apikey".into(),
+            current: Some("OLDSECRET".into()),
+            target: "NEWSECRET".into(),
+            reason: "r".into(),
+        };
+        let p = Providers::parse(&ini(&table(&[]))).unwrap();
+        let w = Write {
+            changes: vec![c.clone()],
+            providers: p.clone(),
+        };
+        let json = plugin_toolkit::serde_json::to_string(&c).unwrap();
+        for out in [
+            format!("{c:?}"),
+            format!("{:?}", p.newznab[0]),
+            format!("{p:?}"),
+            format!("{w:?}"),
+            json.clone(),
+        ] {
+            for secret in ["OLDSECRET", "NEWSECRET", "KEY1", "KEY2", "TKEY"] {
+                assert!(!out.contains(secret), "{secret} in {out}");
+            }
+            assert!(out.contains(scrub::REDACTED), "{out}");
+        }
+        assert!(json.contains("\"key\":\"sab_apikey\""), "{json}");
+        let plain = change("sab_host", "http://h");
+        let json = plugin_toolkit::serde_json::to_string(&plain).unwrap();
+        assert!(json.contains("http://h"), "{json}");
+    }
+
+    #[test]
+    fn serialized_fields_match_the_schema_and_round_trip() {
+        use plugin_toolkit::serde_json::{self, Value};
+        let schema =
+            serde_json::to_value(plugin_toolkit::schemars::schema_for!(SettingChange)).unwrap();
+        let mut props: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        props.sort();
+        let plain = SettingChange {
+            key: "sab_host".into(),
+            current: Some("http://old".into()),
+            target: "http://new".into(),
+            reason: "r".into(),
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        let Value::Object(fields) = &json else {
+            panic!("{json}")
+        };
+        let mut keys: Vec<&String> = fields.keys().collect();
+        keys.sort();
+        assert_eq!(keys, props);
+        let back: SettingChange = serde_json::from_value(json).unwrap();
+        assert_eq!(back, plain);
+    }
+
+    #[test]
     fn form_refuses_targets_mylar_would_not_store() {
         let i = ini(&table(&[]));
         let p = Providers::parse(&i).unwrap();
@@ -1040,18 +1264,26 @@ mod tests {
     }
 
     #[test]
-    fn landed_values_compare_in_stored_form() {
+    fn landed_values_compare_by_equivalence() {
+        // `config.ini` keeps sab_host as posted; the rewrite is in memory only.
         let after = ini(&table(&[
-            ("sab_host", "http://10.0.0.5:8080"),
+            ("sab_host", "http://10.0.0.5:8080/"),
             ("sab_apikey", "^~$z$S0VZMXNhbHRzYWx0"),
             ("sab_to_mylar", "True"),
+            ("sab_priority", "3"),
         ]));
         let ok = [
-            change("sab_host", "10.0.0.5:8080/"),
+            change("sab_host", "http://10.0.0.5:8080/"),
             change("sab_apikey", "KEY1"),
             change("sab_to_mylar", "1"),
+            change("sab_priority", "3"),
         ];
         assert!(unlanded(&after, &ok).is_empty());
+        let equivalent = [
+            change("sab_host", "10.0.0.5:8080"),
+            change("sab_priority", "High"),
+        ];
+        assert!(unlanded(&after, &equivalent).is_empty());
         let bad = [change("sab_apikey", "OTHER"), change("sab_directory", "/x")];
         let missed = unlanded(&after, &bad);
         assert_eq!(
@@ -1122,6 +1354,26 @@ mod tests {
         assert!(rows_unlanded(&spaced, &stored).is_empty());
     }
 
+    #[test]
+    fn equivalent_rewrites_are_not_moves() {
+        let before = ini(&table(&[("gotify_server_url", "https://g")]));
+        let after = ini(&table(&[("gotify_server_url", "https://g/")]));
+        assert!(diff(&before, &after, &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_verifies_a_value_saved_as_posted() {
+        let before = table(&[]);
+        let after = table(&[("sab_host", "http://10.0.0.99:8080/")]);
+        let server = server(&[before.clone(), after], ok()).await;
+        let b = ini(&before);
+        let w = Write {
+            changes: vec![change("sab_host", "http://10.0.0.99:8080/")],
+            providers: Providers::parse(&b).unwrap(),
+        };
+        apply(&mylar(&server), &b, &w).await.unwrap();
+    }
+
     #[tokio::test]
     async fn apply_adds_a_row_and_confirms_it_by_name() {
         let before = table(&[]);
@@ -1141,6 +1393,93 @@ mod tests {
         let form = posted_form(&server).await;
         assert!(form.contains(&("torznab_name_1".to_string(), "Prowlarr".to_string())));
         assert!(form.contains(&("torznab_name6".to_string(), "Jackett".to_string())));
+    }
+
+    fn orders(
+        overrides: &[(&str, &str)],
+        changes: &[SettingChange],
+        edit: &dyn Fn(&mut Providers),
+    ) -> Vec<String> {
+        let before = ini(&table(overrides));
+        let mut p = Providers::parse(&before).unwrap();
+        edit(&mut p);
+        provider_orders(&before, changes, &p)
+    }
+
+    #[test]
+    fn provider_order_follows_provider_sequence() {
+        let torrents = [
+            ("enable_torznab", "True"),
+            ("enable_torrent_search", "True"),
+            ("provider_order", "0, NZBGeek, 1, Jackett"),
+        ];
+        // New names rank after survivors, in reverse of their list order.
+        let add = |p: &mut Providers| {
+            p.torznab.push(row("A", "AK", None));
+            p.torznab.push(row("B", "BK", None));
+        };
+        assert_eq!(
+            orders(&torrents, &[], &add),
+            vec!["0, NZBGeek, 1, Jackett, 2, B, 3, A".to_string()]
+        );
+        assert_eq!(
+            orders(&[], &[change("experimental", "1")], &|_| {}),
+            vec!["0, NZBGeek, 1, Experimental".to_string()]
+        );
+        // A disabled row drops out; survivors keep their relative rank.
+        assert_eq!(
+            orders(&[("provider_order", "0, DOGnzb, 1, NZBGeek")], &[], &|_| {}),
+            vec!["0, NZBGeek".to_string()]
+        );
+        assert_eq!(
+            orders(&[], &[change("newznab", "0")], &|_| {}),
+            vec![String::new()]
+        );
+        // 32p is listed only when no order exists yet.
+        let p32 = [("enable_32p", "True"), ("enable_torrent_search", "True")];
+        let mut saved = p32.to_vec();
+        saved.push(("provider_order", "0, 32p, 1, NZBGeek"));
+        assert_eq!(orders(&saved, &[], &|_| {}), vec!["0, NZBGeek".to_string()]);
+        let mut unset = p32.to_vec();
+        unset.push(("provider_order", "None"));
+        let enable_dog = |p: &mut Providers| p.newznab[1].enabled = "1".into();
+        assert_eq!(
+            orders(&unset, &[], &enable_dog),
+            vec![
+                "0, 32p, 1, NZBGeek, 2, DOGnzb".to_string(),
+                "0, DOGnzb, 1, NZBGeek".to_string(),
+            ]
+        );
+        assert!(orders(&[("provider_order", "x, NZBGeek")], &[], &|_| {}).is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_checks_provider_order_against_provider_sequence() {
+        let before = table(&[("provider_order", "0, DOGnzb, 1, NZBGeek")]);
+        let b = ini(&before);
+        let w = Write {
+            changes: vec![change("usenet_retention", "6000")],
+            providers: Providers::parse(&b).unwrap(),
+        };
+        let after = table(&[
+            ("provider_order", "0, NZBGeek"),
+            ("usenet_retention", "6000"),
+        ]);
+        let srv = server(&[before.clone(), after], ok()).await;
+        apply(&mylar(&srv), &b, &w).await.unwrap();
+
+        let after = table(&[
+            ("provider_order", "0, Experimental, 1, NZBGeek"),
+            ("usenet_retention", "6000"),
+        ]);
+        let srv = server(&[before.clone(), after], ok()).await;
+        let err = apply(&mylar(&srv), &b, &w).await.unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "provider_order: wanted 0, NZBGeek, Mylar stored 0, Experimental, 1, NZBGeek"
+            ),
+            "{err}"
+        );
     }
 
     #[tokio::test]
