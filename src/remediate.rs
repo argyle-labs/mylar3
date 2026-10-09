@@ -451,6 +451,17 @@ mod tests {
         assert!(check_folder(&ini(&lib), "/data").is_err());
         assert!(check_folder(&ini(&lib), "/data/complete").is_ok());
 
+        // Relative paths resolve against Mylar's unknown working directory.
+        assert_eq!(components("downloads/complete"), None);
+        let relative = table(&[("sab_directory", "downloads"), ("check_folder", "/watch")]);
+        assert!(check_folder(&ini(&relative), "downloads/complete").is_err());
+        assert!(check_folder(&ini(&relative), "/downloads/complete").is_err());
+        let relative_lib = table(&[("destination_dir", "comics")]);
+        let err = check_folder(&ini(&relative_lib), "/downloads/complete")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("destination_dir"), "{err}");
+
         let slash = table(&[("sab_directory", "/"), ("check_folder", "None")]);
         assert!(check_folder(&ini(&slash), "/downloads/complete").is_err());
 
