@@ -143,8 +143,10 @@ pub fn is_secret(key: &str) -> bool {
     scrub::is_sensitive_key(key) || MYLAR_SECRETS.contains(&key)
 }
 
-#[orca_struct]
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Debug and Serialize redact a secret key's values, as [`SettingChange::redacted`].
+#[derive(Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(crate = "plugin_toolkit::serde")]
+#[schemars(crate = "plugin_toolkit::schemars")]
 pub struct SettingChange {
     /// `config.ini` key.
     pub key: String,
@@ -166,6 +168,42 @@ impl SettingChange {
             target: scrub::REDACTED.to_string(),
             reason: self.reason.clone(),
         }
+    }
+}
+
+impl std::fmt::Debug for SettingChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = self.redacted();
+        f.debug_struct("SettingChange")
+            .field("key", &r.key)
+            .field("current", &r.current)
+            .field("target", &r.target)
+            .field("reason", &r.reason)
+            .finish()
+    }
+}
+
+impl Serialize for SettingChange {
+    fn serialize<S: plugin_toolkit::serde::Serializer>(
+        &self,
+        s: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(crate = "plugin_toolkit::serde")]
+        struct Shown<'a> {
+            key: &'a str,
+            current: Option<&'a str>,
+            target: &'a str,
+            reason: &'a str,
+        }
+        let r = self.redacted();
+        Shown {
+            key: &r.key,
+            current: r.current.as_deref(),
+            target: &r.target,
+            reason: &r.reason,
+        }
+        .serialize(s)
     }
 }
 
@@ -203,7 +241,7 @@ impl ProviderKind {
 }
 
 /// One indexer row, in Mylar's stored tuple order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderRow {
     pub name: String,
     pub host: String,
@@ -216,6 +254,20 @@ pub struct ProviderRow {
     pub enabled: String,
     /// `None` for a new row; Mylar numbers it on save.
     pub id: Option<u32>,
+}
+
+impl std::fmt::Debug for ProviderRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderRow")
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("verify", &self.verify)
+            .field("apikey", &scrub::REDACTED)
+            .field("extra", &self.extra)
+            .field("enabled", &self.enabled)
+            .field("id", &self.id)
+            .finish()
+    }
 }
 
 impl ProviderRow {
@@ -953,6 +1005,38 @@ mod tests {
         }
         let plain = change("sab_host", "http://h");
         assert_eq!(plain.redacted(), plain);
+    }
+
+    #[test]
+    fn debug_and_serialize_withhold_secrets() {
+        let c = SettingChange {
+            key: "sab_apikey".into(),
+            current: Some("OLDSECRET".into()),
+            target: "NEWSECRET".into(),
+            reason: "r".into(),
+        };
+        let p = Providers::parse(&ini(&table(&[]))).unwrap();
+        let w = Write {
+            changes: vec![c.clone()],
+            providers: p.clone(),
+        };
+        let json = plugin_toolkit::serde_json::to_string(&c).unwrap();
+        for out in [
+            format!("{c:?}"),
+            format!("{:?}", p.newznab[0]),
+            format!("{p:?}"),
+            format!("{w:?}"),
+            json.clone(),
+        ] {
+            for secret in ["OLDSECRET", "NEWSECRET", "KEY1", "KEY2", "TKEY"] {
+                assert!(!out.contains(secret), "{secret} in {out}");
+            }
+            assert!(out.contains(scrub::REDACTED), "{out}");
+        }
+        assert!(json.contains("\"key\":\"sab_apikey\""), "{json}");
+        let plain = change("sab_host", "http://h");
+        let json = plugin_toolkit::serde_json::to_string(&plain).unwrap();
+        assert!(json.contains("http://h"), "{json}");
     }
 
     #[test]

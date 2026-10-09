@@ -96,9 +96,25 @@ struct ConfigTable {
 }
 
 /// `config.ini` options keyed by their lowercase ini name, as Mylar last wrote
-/// them. Secrets are in here too; callers read only the keys they report.
-#[derive(Debug, Default, Clone)]
+/// them. Secrets are in here too; callers read only the keys they report, and
+/// Debug shows only values [`crate::write::shown`] allows.
+#[derive(Default, Clone)]
 pub struct ConfigIni(pub BTreeMap<String, String>);
+
+impl std::fmt::Debug for ConfigIni {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(k, v)| {
+                let v = if crate::write::shown(k, &[]) {
+                    v.as_str()
+                } else {
+                    scrub::REDACTED
+                };
+                (k, v)
+            }))
+            .finish()
+    }
+}
 
 impl ConfigIni {
     /// The value, with Mylar's `None`/empty placeholders as `None`.
@@ -579,5 +595,23 @@ mod tests {
         assert_eq!(ini.flag("c"), None);
         assert_eq!(ini.flag("d"), None);
         assert_eq!(ini.flag("missing"), None);
+    }
+
+    #[test]
+    fn ini_debug_withholds_values_that_may_be_secrets() {
+        let ini = ConfigIni(
+            [
+                ("enable_rss", "True"),
+                ("sab_apikey", "SECRET1"),
+                ("comicvine_api", "SECRET2"),
+                ("sab_host", "http://user:SECRET3@h"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        );
+        let dbg = format!("{ini:?}");
+        assert!(dbg.contains("\"enable_rss\": \"True\""), "{dbg}");
+        assert!(!dbg.contains("SECRET"), "{dbg}");
     }
 }
