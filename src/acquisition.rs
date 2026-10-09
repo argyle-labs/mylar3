@@ -8,6 +8,7 @@ use plugin_toolkit::reqwest::Url;
 use plugin_toolkit::scrub;
 
 use crate::api::ConfigIni;
+use crate::remediate::SettingChange;
 use crate::{ini, secret};
 
 /// The client category mylar3 files its downloads under, per media type.
@@ -147,6 +148,21 @@ pub fn is_secret(key: &str) -> bool {
 /// what Mylar reads back as unset.
 const UNSET: &str = "None";
 
+/// Whether Mylar reads `v` as unset.
+fn is_unset(v: &str) -> bool {
+    matches!(v.trim(), "" | UNSET)
+}
+
+/// `value` for output: withheld for a secret key unless it is unset, and for an
+/// `nzbget_sub` that may hold NZBGet's `user:pass` segment.
+fn shown<'a>(key: &str, value: &'a str) -> &'a str {
+    if (is_secret(key) && !is_unset(value)) || (key == "nzbget_sub" && path_holds_colon(value)) {
+        scrub::REDACTED
+    } else {
+        value
+    }
+}
+
 /// One `config.ini` value, as configparser reads it back.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Setting {
@@ -167,15 +183,10 @@ impl Setting {
 
 impl std::fmt::Debug for Setting {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let value = if is_secret(self.key) && self.value != UNSET {
-            scrub::REDACTED
-        } else {
-            &self.value
-        };
         f.debug_struct("Setting")
             .field("section", &self.section)
             .field("key", &self.key)
-            .field("value", &value)
+            .field("value", &shown(self.key, &self.value))
             .finish()
     }
 }
@@ -346,14 +357,17 @@ fn nzbget_url(url: &str) -> Result<(String, String, Option<String>)> {
 /// `nzbget_sub` as `nzbget.py` uses it, one leading `/` and no trailing one,
 /// so `nzbget` and `/nzbget/` store alike. A final `xmlrpc` segment is dropped:
 /// Mylar appends its own.
-pub(crate) fn nzbget_sub(path: &str) -> Option<String> {
+fn nzbget_sub(path: &str) -> Option<String> {
     let p = path.trim_matches('/');
-    let p = match p.rsplit_once('/') {
+    sub_form(match p.rsplit_once('/') {
         Some((head, "xmlrpc")) => head,
         None if p == "xmlrpc" => "",
         _ => p,
-    };
-    let p = p.trim_end_matches('/');
+    })
+}
+
+fn sub_form(path: &str) -> Option<String> {
+    let p = path.trim_matches('/');
     (!p.is_empty()).then(|| format!("/{p}"))
 }
 
@@ -610,6 +624,201 @@ pub fn map(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<Mapping> 
         .map(|(field, _)| field.to_string())
         .collect();
     Ok(Mapping { settings, ignored })
+}
+
+/// A mapped setting whose stored value Mylar reads differently.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Change {
+    pub setting: Setting,
+    /// The value `config.ini` holds now; `None` when the key is absent.
+    pub current: Option<String>,
+    /// The change unsets a value Mylar reads as set now.
+    pub clears: bool,
+}
+
+impl std::fmt::Debug for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Change")
+            .field("setting", &self.setting)
+            .field(
+                "current",
+                &self.current.as_deref().map(|v| shown(self.setting.key, v)),
+            )
+            .field("clears", &self.clears)
+            .finish()
+    }
+}
+
+/// [`plan`]'s result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientDiff {
+    pub name: String,
+    pub changes: Vec<Change>,
+    /// Fields the client supplied that mylar3 has no setting for.
+    pub ignored: Vec<String>,
+}
+
+/// [`ClientDiff::report`]'s output, secret values withheld.
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientReport {
+    /// Changes that set a value.
+    pub changes: Vec<SettingChange>,
+    /// Changes that unset a value Mylar reads as set now.
+    pub clears: Vec<SettingChange>,
+}
+
+impl ClientDiff {
+    pub fn in_sync(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    pub fn edits(&self) -> Vec<ini::Edit> {
+        self.changes.iter().map(|c| c.setting.edit()).collect()
+    }
+
+    pub fn report(&self) -> ClientReport {
+        let (clears, changes): (Vec<&Change>, Vec<&Change>) =
+            self.changes.iter().partition(|c| c.clears);
+        let out = |changes: Vec<&Change>| {
+            changes
+                .into_iter()
+                .map(|c| {
+                    let key = c.setting.key;
+                    SettingChange {
+                        key: key.to_string(),
+                        current: c.current.as_deref().map(|v| shown(key, v).to_string()),
+                        target: shown(key, &c.setting.value).to_string(),
+                        reason: format!("download client '{}'", self.name),
+                    }
+                })
+                .collect()
+        };
+        ClientReport {
+            changes: out(changes),
+            clears: out(clears),
+        }
+    }
+}
+
+/// Mylar's default for an owned key whose `_CONFIG_DEFINITIONS` default is not
+/// `None`; a missing or unset key reads as it (`minimal_ini` omits defaults).
+fn default(key: &str) -> Option<&'static str> {
+    match key {
+        "sab_priority" => Some("Default"),
+        "sab_to_mylar" | "enable_torrents" | "torrent_local" => Some("False"),
+        "nzb_downloader" => Some("3"),
+        "torrent_downloader" => Some("0"),
+        _ => None,
+    }
+}
+
+/// `sab_host` as Mylar's config load fixes it up, character for character.
+fn sab_host_read(v: &str) -> String {
+    let mut v = if v.starts_with("http://") || v.starts_with("https://") {
+        v.to_string()
+    } else {
+        format!("http://{v}")
+    };
+    if v.ends_with('/') {
+        v.pop();
+    }
+    v
+}
+
+/// `sab_priority` as Mylar's config load reads it: a digit string becomes a
+/// word, any other value is compared exactly, as the senders do.
+fn sab_priority_read(v: &str) -> String {
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return v.to_string();
+    }
+    let word = match v {
+        "1" => "Low",
+        "2" => "Normal",
+        "3" => "High",
+        "4" => "Paused",
+        _ => "Default",
+    };
+    word.to_string()
+}
+
+/// `utorrent_host` as utorrent.py builds its base URL from it.
+fn utorrent_host_read(v: &str) -> String {
+    let v = if v.starts_with("http") {
+        v.to_string()
+    } else {
+        format!("http://{v}")
+    };
+    let v = v.strip_suffix('/').unwrap_or(&v);
+    v.strip_suffix("/gui").unwrap_or(v).to_string()
+}
+
+/// `v` as Mylar acts on it, `None` when unset: a missing or unset key as its
+/// default, secrets decrypted only when Mylar decrypts them, and the forms
+/// Mylar's readers treat alike made equal.
+fn canonical(key: &str, v: Option<&str>, encrypted: bool) -> Option<String> {
+    let v = match v.map(str::trim).filter(|v| !is_unset(v)) {
+        Some(v) => v,
+        None => default(key)?,
+    };
+    let v = if encrypted && ENCRYPTED.contains(&key) {
+        secret::decode(v).unwrap_or_else(|| v.to_string())
+    } else {
+        v.to_string()
+    };
+    match key {
+        "nzbget_sub" => sub_form(&v),
+        "sab_host" => Some(sab_host_read(&v)),
+        "sab_priority" => Some(sab_priority_read(&v)),
+        "utorrent_host" => Some(utorrent_host_read(&v)),
+        "nzb_downloader" | "torrent_downloader" => {
+            Some(v.parse::<u8>().map_or(v, |n| n.to_string()))
+        }
+        "sab_to_mylar" | "enable_torrents" | "torrent_local" => {
+            Some(match v.to_ascii_lowercase().as_str() {
+                "1" | "yes" | "true" | "on" => "True".to_string(),
+                "0" | "no" | "false" | "off" => "False".to_string(),
+                _ => v,
+            })
+        }
+        _ => Some(v),
+    }
+}
+
+/// The settings `client` changes, against `ini`'s configparser-read values:
+/// `%` unescaped, as `/getConfig` serves them and [`ini::get`] returns them.
+pub fn plan(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<ClientDiff> {
+    let mapping = map(ini, client)?;
+    let encrypted = encrypts(ini);
+    let stored = |key| canonical(key, ini.0.get(key).map(String::as_str), encrypted);
+    // In Docker, Mylar fills an unset SAB directory with these in memory
+    // (config.py, DOCKER-AWARE) and a web save persists them.
+    let docker_sab = mapping
+        .settings
+        .iter()
+        .any(|s| s.key == "sab_directory" && s.value == UNSET)
+        && stored("sab_to_mylar").as_deref() == Some("True")
+        && stored("sab_directory").as_deref() == Some("/downloads");
+    let changes = mapping
+        .settings
+        .into_iter()
+        .filter(|s| !(docker_sab && matches!(s.key, "sab_directory" | "sab_to_mylar")))
+        .filter_map(|setting| {
+            let current = ini.0.get(setting.key).cloned();
+            let stored = canonical(setting.key, current.as_deref(), encrypted);
+            let target = canonical(setting.key, Some(&setting.value), encrypted);
+            (stored != target).then(|| Change {
+                clears: target.is_none(),
+                setting,
+                current,
+            })
+        })
+        .collect();
+    Ok(ClientDiff {
+        name: client.name.clone(),
+        changes,
+        ignored: mapping.ignored,
+    })
 }
 
 #[cfg(test)]
@@ -1459,5 +1668,415 @@ mod tests {
             );
             assert!(!format!("{m:?}").contains(&pw.value), "{provider:?}");
         }
+    }
+
+    fn changed(saved: &[(&str, &str)], c: &ResolvedDownloadClient) -> Vec<(String, String)> {
+        plan(&ini(saved), c)
+            .unwrap()
+            .changes
+            .into_iter()
+            .map(|c| (c.setting.key.to_string(), c.setting.value))
+            .collect()
+    }
+
+    const SAB_SAVED: &[(&str, &str)] = &[
+        ("sab_host", "http://10.0.0.15:8080"),
+        ("sab_apikey", "SABKEY"),
+        ("sab_username", "None"),
+        ("sab_password", ""),
+        ("sab_category", "comics"),
+        ("sab_priority", "Default"),
+        ("sab_directory", "/downloads/complete"),
+        ("sab_to_mylar", "True"),
+        ("nzb_downloader", "0"),
+    ];
+
+    #[test]
+    fn a_client_already_stored_plans_nothing() {
+        let diff = plan(&ini(SAB_SAVED), &sab("http://10.0.0.15:8080", "SABKEY")).unwrap();
+        assert!(diff.in_sync(), "{diff:?}");
+        assert!(diff.edits().is_empty());
+
+        let mut saved = SAB_SAVED.to_vec();
+        saved.retain(|(k, _)| *k != "sab_username");
+        assert!(changed(&saved, &sab("http://10.0.0.15:8080", "SABKEY")).is_empty());
+    }
+
+    #[test]
+    fn forms_mylar_reads_alike_are_not_rewritten() {
+        let c = sab("http://10.0.0.15:8080", "SABKEY");
+        let with = |key: &str, v: &str| {
+            let mut saved = SAB_SAVED.to_vec();
+            saved.retain(|(k, _)| *k != key);
+            saved.push((key, v));
+            changed(&saved, &c)
+        };
+        for (key, saved) in [
+            ("sab_host", "10.0.0.15:8080/"),
+            ("sab_host", "http://10.0.0.15:8080/"),
+            ("sab_priority", "0"),
+            ("sab_to_mylar", "true"),
+            ("sab_to_mylar", "yes"),
+            ("nzb_downloader", "00"),
+        ] {
+            assert!(with(key, saved).is_empty(), "{key}={saved}");
+        }
+        assert_eq!(
+            with("sab_priority", "3"),
+            vec![("sab_priority".to_string(), "Default".to_string())]
+        );
+        assert_eq!(
+            with("sab_host", "http://10.0.0.16:8080"),
+            vec![("sab_host".to_string(), "http://10.0.0.15:8080".to_string())]
+        );
+
+        let n = nzbget("http://10.0.0.15:6789/nzbget");
+        let base = [
+            ("nzbget_host", "http://10.0.0.15"),
+            ("nzbget_port", "6789"),
+            ("nzbget_category", "comics"),
+            ("nzb_downloader", "1"),
+        ];
+        for saved in ["nzbget", "/nzbget/", "/nzbget"] {
+            let mut s = base.to_vec();
+            s.push(("nzbget_sub", saved));
+            assert!(changed(&s, &n).is_empty(), "{saved}");
+        }
+        let mut s = base.to_vec();
+        s.push(("nzbget_sub", "/nzbget/xmlrpc"));
+        assert_eq!(
+            changed(&s, &n),
+            vec![("nzbget_sub".to_string(), "/nzbget".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_stale_value_is_cleared_to_none() {
+        let n = nzbget("http://10.0.0.15:6789");
+        let diff = plan(&ini(&[("nzbget_sub", "/nzbget")]), &n).unwrap();
+        let sub = diff
+            .changes
+            .iter()
+            .find(|c| c.setting.key == "nzbget_sub")
+            .unwrap();
+        assert_eq!(sub.setting.value, "None");
+        assert_eq!(sub.current.as_deref(), Some("/nzbget"));
+        assert_eq!(sub.setting.edit().value, "None");
+        assert!(sub.clears);
+        let host = diff
+            .changes
+            .iter()
+            .find(|c| c.setting.key == "nzbget_host")
+            .unwrap();
+        assert!(!host.clears);
+        let report = diff.report();
+        assert_eq!(
+            report.clears.iter().map(|c| &c.key).collect::<Vec<_>>(),
+            ["nzbget_sub"]
+        );
+        assert!(!report.changes.iter().any(|c| c.key == "nzbget_sub"));
+        assert!(report.changes.iter().any(|c| c.key == "nzbget_host"));
+        for saved in ["None", "", " "] {
+            let diff = plan(&ini(&[("nzbget_sub", saved)]), &n).unwrap();
+            assert!(
+                !diff.changes.iter().any(|c| c.setting.key == "nzbget_sub"),
+                "{saved:?}"
+            );
+        }
+
+        let rt = ResolvedDownloadClient {
+            url: Some("http://10.0.0.17:5000".into()),
+            ..client(ClientProvider::Rtorrent)
+        };
+        assert!(changed(&[("rtorrent_rpc_url", "RPC2")], &rt)
+            .contains(&("rtorrent_rpc_url".to_string(), "None".to_string())));
+        let d = deluge("10.0.0.20:58846");
+        assert!(changed(&[("deluge_download_directory", "/old")], &d)
+            .contains(&("deluge_download_directory".to_string(), String::new())));
+        assert!(!changed(&[("deluge_download_directory", "")], &d)
+            .iter()
+            .any(|(k, _)| k == "deluge_download_directory"));
+    }
+
+    #[test]
+    fn encrypted_values_compare_by_plaintext_only_when_mylar_decrypts() {
+        let c = ResolvedDownloadClient {
+            username: Some("me".into()),
+            ..sab("http://10.0.0.15:8080", "SABKEY")
+        };
+        let stored = secret::encode("SABKEY").unwrap();
+        let mut saved = SAB_SAVED.to_vec();
+        saved.retain(|(k, _)| *k != "sab_apikey" && *k != "sab_username");
+        saved.push(("sab_apikey", &stored));
+        saved.push(("sab_username", "me"));
+        let off = changed(&saved, &c);
+        assert_eq!(off, vec![("sab_apikey".to_string(), "SABKEY".to_string())]);
+        let mut yes = saved.clone();
+        yes.push(("encrypt_passwords", "yes"));
+        assert!(changed(&yes, &c).is_empty());
+        let mut unparsed = saved.clone();
+        unparsed.push(("encrypt_passwords", "maybe"));
+        assert_eq!(changed(&unparsed, &c).len(), 1);
+
+        saved.push(("encrypt_passwords", "True"));
+        assert!(changed(&saved, &c).is_empty());
+
+        let username = secret::encode("me").unwrap();
+        let mut encoded_name = saved.clone();
+        encoded_name.retain(|(k, _)| *k != "sab_username");
+        encoded_name.push(("sab_username", &username));
+        assert_eq!(
+            changed(&encoded_name, &c),
+            vec![("sab_username".to_string(), "me".to_string())]
+        );
+
+        let other = ResolvedDownloadClient {
+            api_key: Some("NEWKEY".into()),
+            ..c
+        };
+        let diff = changed(&saved, &other);
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert_eq!(diff[0].0, "sab_apikey");
+        assert_eq!(secret::decode(&diff[0].1).as_deref(), Some("NEWKEY"));
+    }
+
+    #[test]
+    fn sab_priority_words_compare_exactly_and_digits_as_mylar_reads_them() {
+        let with = |saved: &str, p: Option<&str>| {
+            let mut s = SAB_SAVED.to_vec();
+            s.retain(|(k, _)| *k != "sab_priority");
+            s.push(("sab_priority", saved));
+            let c = ResolvedDownloadClient {
+                priority: p.map(Into::into),
+                ..sab("http://10.0.0.15:8080", "SABKEY")
+            };
+            changed(&s, &c)
+        };
+        assert_eq!(
+            with("high", Some("High")),
+            vec![("sab_priority".to_string(), "High".to_string())]
+        );
+        assert_eq!(
+            with("default", None),
+            vec![("sab_priority".to_string(), "Default".to_string())]
+        );
+        assert!(with("High", Some("high")).is_empty());
+        for saved in ["0", "5", "9", "00", "03", "None", ""] {
+            assert!(with(saved, None).is_empty(), "{saved:?}");
+        }
+        assert!(with("3", Some("High")).is_empty());
+    }
+
+    #[test]
+    fn a_missing_key_reads_as_its_mylar_default() {
+        let c = ResolvedDownloadClient {
+            directory: None,
+            ..sab("http://10.0.0.15:8080", "SABKEY")
+        };
+        let mut saved = SAB_SAVED.to_vec();
+        saved.retain(|(k, _)| !matches!(*k, "sab_priority" | "sab_to_mylar" | "sab_directory"));
+        assert!(changed(&saved, &c).is_empty());
+        saved.retain(|(k, _)| *k != "nzb_downloader");
+        assert_eq!(
+            changed(&saved, &c),
+            vec![("nzb_downloader".to_string(), "0".to_string())]
+        );
+        let unset: Vec<_> = SAB_SAVED
+            .iter()
+            .map(|&(k, v)| match k {
+                "sab_priority" | "sab_to_mylar" | "sab_directory" => (k, "None"),
+                _ => (k, v),
+            })
+            .collect();
+        assert!(changed(&unset, &c).is_empty());
+
+        let watch = ResolvedDownloadClient {
+            directory: Some("/watch".into()),
+            ..client(ClientProvider::Watchdir)
+        };
+        assert_eq!(
+            changed(&[("local_watchdir", "/watch")], &watch),
+            vec![
+                ("torrent_local".to_string(), "True".to_string()),
+                ("enable_torrents".to_string(), "True".to_string()),
+            ]
+        );
+        let diff = plan(&ini(&[("local_watchdir", "/watch")]), &watch).unwrap();
+        assert!(diff
+            .changes
+            .iter()
+            .all(|c| !c.clears && c.current.is_none()));
+    }
+
+    #[test]
+    fn sab_host_compares_by_mylars_literal_fix_up() {
+        let with = |saved: &str| {
+            let mut s = SAB_SAVED.to_vec();
+            s.retain(|(k, _)| *k != "sab_host");
+            s.push(("sab_host", saved));
+            changed(&s, &sab("http://10.0.0.15:8080", "SABKEY"))
+        };
+        for saved in [
+            "10.0.0.15:8080",
+            "10.0.0.15:8080/",
+            "http://10.0.0.15:8080/",
+        ] {
+            assert!(with(saved).is_empty(), "{saved}");
+        }
+        for saved in [
+            "HTTP://10.0.0.15:8080",
+            "http://10.0.0.15:8080//",
+            "http://10.0.0.15:80800",
+        ] {
+            assert_eq!(with(saved).len(), 1, "{saved}");
+        }
+        let https = sab("https://s.example/sabnzbd/", "SABKEY");
+        let mut s = SAB_SAVED.to_vec();
+        s.retain(|(k, _)| *k != "sab_host");
+        s.push(("sab_host", "https://s.example/sabnzbd/"));
+        assert!(changed(&s, &https).is_empty());
+    }
+
+    #[test]
+    fn utorrent_host_compares_as_utorrent_py_builds_it() {
+        let c = |url: &str| ResolvedDownloadClient {
+            url: Some(url.into()),
+            ..client(ClientProvider::Utorrent)
+        };
+        let host = |saved: &str, url: &str| {
+            changed(
+                &[
+                    ("utorrent_host", saved),
+                    ("utorrent_label", "comics"),
+                    ("torrent_downloader", "1"),
+                    ("enable_torrents", "True"),
+                ],
+                &c(url),
+            )
+        };
+        for saved in [
+            "10.0.0.18:8080",
+            "http://10.0.0.18:8080/",
+            "http://10.0.0.18:8080/gui",
+            "http://10.0.0.18:8080/gui/",
+        ] {
+            assert!(host(saved, "10.0.0.18:8080").is_empty(), "{saved}");
+        }
+        assert!(host("http://10.0.0.18:8080/gui", "http://10.0.0.18:8080/").is_empty());
+        assert_eq!(
+            host("http://10.0.0.18:8080/gui/gui", "http://10.0.0.18:8080/gui"),
+            vec![(
+                "utorrent_host".to_string(),
+                "http://10.0.0.18:8080/gui".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn docker_sab_defaults_are_in_sync_when_orca_gives_no_directory() {
+        let c = ResolvedDownloadClient {
+            directory: None,
+            ..sab("http://10.0.0.15:8080", "SABKEY")
+        };
+        let with = |dir: &str, to_mylar: &str| {
+            let mut s = SAB_SAVED.to_vec();
+            s.retain(|(k, _)| !matches!(*k, "sab_directory" | "sab_to_mylar"));
+            s.push(("sab_directory", dir));
+            s.push(("sab_to_mylar", to_mylar));
+            changed(&s, &c)
+        };
+        assert!(with("/downloads", "True").is_empty());
+        assert!(with("/downloads", "1").is_empty());
+        assert_eq!(with("/downloads", "False").len(), 1);
+        assert_eq!(with("/other", "True").len(), 2);
+        let given = ResolvedDownloadClient {
+            directory: Some("/complete".into()),
+            ..c
+        };
+        let mut s = SAB_SAVED.to_vec();
+        s.retain(|(k, _)| *k != "sab_directory");
+        s.push(("sab_directory", "/downloads"));
+        assert_eq!(
+            changed(&s, &given),
+            vec![("sab_directory".to_string(), "/complete".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_stored_nzbget_sub_with_credentials_is_withheld() {
+        let n = nzbget("http://10.0.0.15:6789/nzbget");
+        let diff = plan(&ini(&[("nzbget_sub", "/nzbget:OLDPW")]), &n).unwrap();
+        let report = diff.report();
+        let sub = report
+            .changes
+            .iter()
+            .find(|c| c.key == "nzbget_sub")
+            .unwrap();
+        assert_eq!(sub.current.as_deref(), Some(scrub::REDACTED));
+        assert_eq!(sub.target, "/nzbget");
+        assert!(!format!("{diff:?}").contains("OLDPW"));
+    }
+
+    #[test]
+    fn report_and_debug_withhold_secrets_and_show_the_rest() {
+        let saved = [
+            ("sab_host", "http://10.0.0.16:8080"),
+            ("sab_apikey", "OLDSECRET"),
+            ("sab_password", "OLDPW"),
+        ];
+        let diff = plan(&ini(&saved), &sab("http://10.0.0.15:8080", "NEWSECRET")).unwrap();
+        let report = diff.report();
+        let json = plugin_toolkit::serde_json::to_string(&report).unwrap();
+        for out in [format!("{diff:?}"), format!("{report:?}"), json.clone()] {
+            for secret in ["OLDSECRET", "NEWSECRET", "OLDPW"] {
+                assert!(!out.contains(secret), "{secret} in {out}");
+            }
+            assert!(out.contains(scrub::REDACTED), "{out}");
+            assert!(
+                out.contains("10.0.0.16:8080") && out.contains("10.0.0.15:8080"),
+                "{out}"
+            );
+        }
+        let get = |key: &str| report.changes.iter().find(|c| c.key == key).unwrap();
+        let key = get("sab_apikey");
+        assert_eq!(key.target, scrub::REDACTED);
+        assert_eq!(key.current.as_deref(), Some(scrub::REDACTED));
+        let pw = report
+            .clears
+            .iter()
+            .find(|c| c.key == "sab_password")
+            .unwrap();
+        assert_eq!(pw.target, "None");
+        assert_eq!(pw.current.as_deref(), Some(scrub::REDACTED));
+        assert!(!report.changes.iter().any(|c| c.key == "sab_username"));
+        assert_eq!(
+            get("sab_host").current.as_deref(),
+            Some("http://10.0.0.16:8080")
+        );
+        assert_eq!(key.reason, "download client 'dl'");
+    }
+
+    #[test]
+    fn diff_edits_are_what_a_direct_write_needs() {
+        let c = ResolvedDownloadClient {
+            password: Some("50%off".into()),
+            ..sab("http://10.0.0.15:8080", "SABKEY")
+        };
+        let diff = plan(&ini(SAB_SAVED), &c).unwrap();
+        assert_eq!(
+            diff.edits(),
+            vec![ini::Edit {
+                section: "SABnzbd".into(),
+                key: "sab_password".into(),
+                value: "50%off".into(),
+            }]
+        );
+        let text = ini::rewrite("[SABnzbd]\nsab_password = \n", &diff.edits()).unwrap();
+        let read = ini::get(&text, "SABnzbd", "sab_password").unwrap();
+        assert_eq!(read, "50%off");
+        let mut saved = SAB_SAVED.to_vec();
+        saved.retain(|(k, _)| *k != "sab_password");
+        saved.push(("sab_password", &read));
+        assert!(plan(&ini(&saved), &c).unwrap().in_sync());
     }
 }
