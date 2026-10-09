@@ -122,6 +122,19 @@ const MYLAR_SECRETS: &[&str] = &[
     "pp_sshpasswd",
 ];
 
+/// Settings `provider_sequence()` derives `provider_order` from, besides the
+/// indexer rows. It rebuilds the order on every save.
+const PROVIDER_ORDER_INPUTS: &[&str] = &[
+    "enable_32p",
+    "enable_ddl",
+    "enable_external_server",
+    "enable_getcomics",
+    "enable_torrent_search",
+    "enable_torznab",
+    "experimental",
+    "newznab",
+];
+
 /// Prefix of a value Mylar stored with `encrypt_passwords`:
 /// `^~$z$` + base64(secret + 8-byte salt), re-salted on every save.
 const ENCRYPTED_PREFIX: &str = "^~$z$";
@@ -684,12 +697,20 @@ pub async fn apply(m: &Mylar, before: &ConfigIni, write: &Write) -> Result<()> {
         Ok(got) => rows_unlanded(&write.providers, &got),
         Err(e) => vec![format!("indexer rows unreadable after the write: {e}")],
     };
-    let planned: Vec<&str> = write
+    let mut planned: Vec<&str> = write
         .changes
         .iter()
         .map(|c| c.key.as_str())
         .chain(ProviderKind::ALL.iter().map(|k| k.ini_key()))
         .collect();
+    let reorders = Providers::parse(before).map_or(true, |p| p != write.providers)
+        || write
+            .changes
+            .iter()
+            .any(|c| PROVIDER_ORDER_INPUTS.contains(&c.key.as_str()));
+    if reorders {
+        planned.push("provider_order");
+    }
     let side_effects = diff(before, &after, &planned);
     if missed.is_empty() && rows.is_empty() && side_effects.is_empty() {
         return Ok(());
@@ -1177,6 +1198,53 @@ mod tests {
         let form = posted_form(&server).await;
         assert!(form.contains(&("torznab_name_1".to_string(), "Prowlarr".to_string())));
         assert!(form.contains(&("torznab_name6".to_string(), "Jackett".to_string())));
+    }
+
+    #[tokio::test]
+    async fn provider_order_may_move_only_when_rows_or_their_switches_change() {
+        let before = table(&[("provider_order", "0, NZBGeek, 1, DOGnzb")]);
+        let after = table(&[
+            ("provider_order", "0, NZBGeek, 1, DOGnzb, 2, Prowlarr"),
+            (
+                "extra_torznabs",
+                "Jackett, http://10.0.0.16:9117/api, 0, TKEY, 7030#8000, 1, 6, Prowlarr, https://prowlarr.example, 1, PKEY, 7030, 1, 7",
+            ),
+        ]);
+        let srv = server(&[before.clone(), after], ok()).await;
+        let b = ini(&before);
+        let mut providers = Providers::parse(&b).unwrap();
+        providers.torznab.push(row("Prowlarr", "PKEY", None));
+        let w = Write {
+            changes: vec![],
+            providers,
+        };
+        apply(&mylar(&srv), &b, &w).await.unwrap();
+
+        let after = table(&[
+            ("provider_order", "0, Experimental"),
+            ("experimental", "True"),
+        ]);
+        let srv = server(&[before.clone(), after], ok()).await;
+        let w = Write {
+            changes: vec![change("experimental", "True")],
+            providers: Providers::parse(&b).unwrap(),
+        };
+        apply(&mylar(&srv), &b, &w).await.unwrap();
+
+        let after = table(&[
+            ("provider_order", "0, DOGnzb, 1, NZBGeek"),
+            ("usenet_retention", "6000"),
+        ]);
+        let srv = server(&[before.clone(), after], ok()).await;
+        let w = Write {
+            changes: vec![change("usenet_retention", "6000")],
+            providers: Providers::parse(&b).unwrap(),
+        };
+        let err = apply(&mylar(&srv), &b, &w).await.unwrap_err().to_string();
+        assert!(
+            err.contains("other settings moved: [provider_order"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
