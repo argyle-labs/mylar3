@@ -1040,6 +1040,30 @@ mod tests {
     }
 
     #[test]
+    fn serialized_fields_match_the_schema_and_round_trip() {
+        use plugin_toolkit::serde_json::{self, Value};
+        let schema =
+            serde_json::to_value(plugin_toolkit::schemars::schema_for!(SettingChange)).unwrap();
+        let mut props: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        props.sort();
+        let plain = SettingChange {
+            key: "sab_host".into(),
+            current: Some("http://old".into()),
+            target: "http://new".into(),
+            reason: "r".into(),
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        let Value::Object(fields) = &json else {
+            panic!("{json}")
+        };
+        let mut keys: Vec<&String> = fields.keys().collect();
+        keys.sort();
+        assert_eq!(keys, props);
+        let back: SettingChange = serde_json::from_value(json).unwrap();
+        assert_eq!(back, plain);
+    }
+
+    #[test]
     fn form_refuses_targets_mylar_would_not_store() {
         let i = ini(&table(&[]));
         let p = Providers::parse(&i).unwrap();
