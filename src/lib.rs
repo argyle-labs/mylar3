@@ -10,6 +10,7 @@ pub mod api;
 mod definitions;
 pub mod execute;
 pub mod remediate;
+pub mod secret;
 pub mod status;
 pub mod tools;
 

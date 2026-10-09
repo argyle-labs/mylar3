@@ -21,6 +21,7 @@ path = "src/main.rs"
 # plugin-toolkit alone.
 [dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+getrandom = "0.3"
 
 [dev-dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
