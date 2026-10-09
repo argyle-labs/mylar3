@@ -16,19 +16,46 @@ pub fn category_map(media_type: &str) -> Option<&'static str> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Usenet,
+    Torrent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientProvider {
     Sabnzbd,
     Nzbget,
     Blackhole,
+    Qbittorrent,
+    Deluge,
+    Transmission,
+    Rtorrent,
+    Utorrent,
+    Watchdir,
 }
 
 impl ClientProvider {
+    pub fn protocol(self) -> Protocol {
+        match self {
+            ClientProvider::Sabnzbd | ClientProvider::Nzbget | ClientProvider::Blackhole => {
+                Protocol::Usenet
+            }
+            _ => Protocol::Torrent,
+        }
+    }
+
     /// The `config.ini` section holding this client's settings.
     fn section(self) -> &'static str {
         match self {
             ClientProvider::Sabnzbd => "SABnzbd",
             ClientProvider::Nzbget => "NZBGet",
             ClientProvider::Blackhole => "Blackhole",
+            ClientProvider::Qbittorrent => "qBittorrent",
+            ClientProvider::Deluge => "Deluge",
+            ClientProvider::Transmission => "Transmission",
+            ClientProvider::Rtorrent => "Rtorrent",
+            ClientProvider::Utorrent => "uTorrent",
+            ClientProvider::Watchdir => "Watchdir",
         }
     }
 
@@ -38,6 +65,12 @@ impl ClientProvider {
             ClientProvider::Sabnzbd => ("nzb_downloader", "0"),
             ClientProvider::Nzbget => ("nzb_downloader", "1"),
             ClientProvider::Blackhole => ("nzb_downloader", "2"),
+            ClientProvider::Watchdir => ("torrent_downloader", "0"),
+            ClientProvider::Utorrent => ("torrent_downloader", "1"),
+            ClientProvider::Rtorrent => ("torrent_downloader", "2"),
+            ClientProvider::Transmission => ("torrent_downloader", "3"),
+            ClientProvider::Deluge => ("torrent_downloader", "4"),
+            ClientProvider::Qbittorrent => ("torrent_downloader", "5"),
         }
     }
 }
@@ -57,8 +90,13 @@ pub struct ResolvedDownloadClient {
     /// Client category or label; defaults to [`category_map`]`("comics")`.
     pub category: Option<String>,
     /// A folder as Mylar's container sees it: where SABnzbd/NZBGet complete
-    /// into (`sab_directory`, `nzbget_directory`), or the blackhole folder.
+    /// into (`sab_directory`, `nzbget_directory`), or the blackhole/watch
+    /// folder (`blackhole_dir`, `local_watchdir`).
     pub directory: Option<String>,
+    /// The folder a torrent client saves into, as the client sees it:
+    /// `qbittorrent_folder`, `deluge_download_directory`,
+    /// `transmission_directory`, `rtorrent_directory`.
+    pub client_directory: Option<String>,
     pub priority: Option<String>,
 }
 
@@ -82,6 +120,7 @@ impl std::fmt::Debug for ResolvedDownloadClient {
             .field("api_key", &self.api_key.as_ref().map(|_| scrub::REDACTED))
             .field("category", &self.category)
             .field("directory", &self.directory)
+            .field("client_directory", &self.client_directory)
             .field("priority", &self.priority)
             .finish()
     }
@@ -89,7 +128,16 @@ impl std::fmt::Debug for ResolvedDownloadClient {
 
 /// Client keys Mylar stores encrypted when `encrypt_passwords` is on
 /// (`encrypt_items` in `mylar/config.py`).
-const ENCRYPTED: &[&str] = &["sab_password", "sab_apikey", "nzbget_password"];
+const ENCRYPTED: &[&str] = &[
+    "sab_password",
+    "sab_apikey",
+    "nzbget_password",
+    "utorrent_password",
+    "transmission_password",
+    "deluge_password",
+    "qbittorrent_password",
+    "rtorrent_password",
+];
 
 pub fn is_secret(key: &str) -> bool {
     ENCRYPTED.contains(&key) || scrub::is_sensitive_key(key)
@@ -309,6 +357,85 @@ pub(crate) fn nzbget_sub(path: &str) -> Option<String> {
     (!p.is_empty()).then(|| format!("/{p}"))
 }
 
+/// transmissionrpc uses a URL with a scheme verbatim, adding
+/// `/transmission/rpc` only to a bare `host:port`.
+fn transmission_url(url: &str) -> Result<String> {
+    let u = http_url(url)?;
+    if u.query().is_some() || u.fragment().is_some() {
+        bail!("Transmission url must not carry a query or fragment");
+    }
+    Ok(if matches!(u.path(), "" | "/") {
+        format!("{}/transmission/rpc", url.trim_end_matches('/'))
+    } else {
+        url.to_string()
+    })
+}
+
+/// `(rtorrent_host, rtorrent_rpc_url)`: Mylar cleans the host to
+/// `scheme://host:port/` and appends the rpc url. It prefixes `http://` to any
+/// host not starting `https:`/`http://`, so other schemes cannot be stored.
+fn rtorrent_url(url: &str) -> Result<(String, Option<String>)> {
+    if !url.contains("://") {
+        bail!("rTorrent url needs an http:// or https:// scheme");
+    }
+    let u = http_url(url)?;
+    if u.query().is_some() || u.fragment().is_some() {
+        bail!("rTorrent url must not carry a query or fragment");
+    }
+    let host = u.host_str().ok_or_else(|| anyhow!("url has no host"))?;
+    let base = match u.port() {
+        Some(port) => format!("{}://{host}:{port}", u.scheme()),
+        None => format!("{}://{host}", u.scheme()),
+    };
+    let rpc = u.path().trim_start_matches('/');
+    Ok((base, (!rpc.is_empty()).then(|| rpc.to_string())))
+}
+
+/// `utorrent_host` with its path kept as given: utorrent.py strips one `/`
+/// and one `/gui` before appending `/gui/`, so rewriting the path could change
+/// the URL Mylar builds. It prefixes `http://` only to a host not starting
+/// `http`, so a bare host gets it here: `httpbox` would otherwise go unprefixed.
+fn utorrent_host(url: &str) -> Result<String> {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    let u = http_url(&format!("{scheme}://{rest}"))?;
+    if u.query().is_some() || u.fragment().is_some() {
+        bail!("uTorrent url must not carry a query or fragment");
+    }
+    Ok(format!("{}://{rest}", u.scheme()))
+}
+
+/// Deluge's `host:port`: Mylar splits the setting on `:`, so no scheme and no
+/// IPv6 literal.
+fn deluge_host(url: &str) -> Result<String> {
+    let with_scheme = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("http://{url}")
+    };
+    let u = Url::parse(&with_scheme).map_err(|_| anyhow!("url is not host:port or a URL"))?;
+    let host = u.host_str().ok_or_else(|| anyhow!("url has no host"))?;
+    if host.starts_with('[') {
+        bail!("Deluge's host cannot be an IPv6 literal; Mylar splits deluge_host on ':'");
+    }
+    if !matches!(u.path(), "" | "/") || u.query().is_some() || u.fragment().is_some() {
+        bail!("Deluge url must be host:port, without a path, query or fragment");
+    }
+    // `Url` drops a scheme's default port, so read it from the text.
+    let authority = with_scheme
+        .split_once("://")
+        .map_or("", |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let port = authority
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|p| p.parse::<u16>().ok())
+        .ok_or_else(|| anyhow!("url has no port"))?;
+    Ok(format!("{host}:{port}"))
+}
+
 /// Mylar decrypts when `ENCRYPT_PASSWORDS is True`, which config load sets
 /// with configparser's `getboolean`.
 fn encrypts(ini: &ConfigIni) -> bool {
@@ -331,6 +458,7 @@ pub fn map(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<Mapping> 
     let api_key = present_secret("api_key", &client.api_key)?;
     let category_given = present("category", &client.category)?;
     let directory = present("directory", &client.directory)?;
+    let client_directory = present("client_directory", &client.client_directory)?;
     let priority_given = present("priority", &client.priority)?;
     let need_url = || -> Result<&str> {
         let url = url.ok_or_else(|| anyhow!("{provider:?} needs a url"))?;
@@ -383,6 +511,68 @@ pub fn map(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<Mapping> 
             put("nzbget_directory", directory, "directory");
         }
         Blackhole => put("blackhole_dir", Some(need_dir()?), "directory"),
+        Qbittorrent => {
+            let url = need_url()?;
+            let u = http_url(url)?;
+            if u.query().is_some() || u.fragment().is_some() {
+                bail!("qBittorrent url must not carry a query or fragment");
+            }
+            put("qbittorrent_host", Some(url), "url");
+            put("qbittorrent_username", username, "username");
+            put("qbittorrent_password", password, "password");
+            put("qbittorrent_label", category, "category");
+            put("qbittorrent_folder", client_directory, "client_directory");
+        }
+        Deluge => {
+            let host = deluge_host(need_url()?)?;
+            // deluge.py refuses to connect without both.
+            if username.is_none() || password.is_none() {
+                bail!("Deluge needs a username and password");
+            }
+            put("deluge_host", Some(&host), "url");
+            put("deluge_username", username, "username");
+            put("deluge_password", password, "password");
+            put("deluge_label", category, "category");
+            // Its default is "", not None.
+            put(
+                "deluge_download_directory",
+                Some(client_directory.unwrap_or("")),
+                "client_directory",
+            );
+        }
+        Transmission => {
+            put(
+                "transmission_host",
+                Some(&transmission_url(need_url()?)?),
+                "url",
+            );
+            put("transmission_username", username, "username");
+            put("transmission_password", password, "password");
+            put(
+                "transmission_directory",
+                client_directory,
+                "client_directory",
+            );
+        }
+        Rtorrent => {
+            let (host, rpc) = rtorrent_url(need_url()?)?;
+            put("rtorrent_host", Some(&host), "url");
+            put("rtorrent_rpc_url", rpc.as_deref(), "url");
+            put("rtorrent_username", username, "username");
+            put("rtorrent_password", password, "password");
+            put("rtorrent_label", category, "category");
+            put("rtorrent_directory", client_directory, "client_directory");
+        }
+        Utorrent => {
+            put("utorrent_host", Some(&utorrent_host(need_url()?)?), "url");
+            put("utorrent_username", username, "username");
+            put("utorrent_password", password, "password");
+            put("utorrent_label", category, "category");
+        }
+        Watchdir => {
+            put("local_watchdir", Some(need_dir()?), "directory");
+            put("torrent_local", Some("True"), "directory");
+        }
     }
     let (selector, value) = provider.selector();
     settings.push(Setting {
@@ -390,6 +580,13 @@ pub fn map(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<Mapping> 
         key: selector,
         value: value.to_string(),
     });
+    if provider.protocol() == Protocol::Torrent {
+        settings.push(Setting {
+            section: "Torrents",
+            key: "enable_torrents",
+            value: "True".to_string(),
+        });
+    }
     if encrypts(ini) {
         for s in &mut settings {
             if ENCRYPTED.contains(&s.key) && s.value != UNSET {
@@ -404,6 +601,7 @@ pub fn map(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<Mapping> 
         ("api_key", api_key.is_some()),
         ("category", category_given.is_some()),
         ("directory", directory.is_some()),
+        ("client_directory", client_directory.is_some()),
         ("priority", priority_given.is_some()),
     ];
     let ignored = supplied
@@ -613,7 +811,15 @@ mod tests {
 
     #[test]
     fn urls_refuse_credentials() {
-        for provider in [ClientProvider::Sabnzbd, ClientProvider::Nzbget] {
+        for provider in [
+            ClientProvider::Sabnzbd,
+            ClientProvider::Nzbget,
+            ClientProvider::Qbittorrent,
+            ClientProvider::Deluge,
+            ClientProvider::Transmission,
+            ClientProvider::Rtorrent,
+            ClientProvider::Utorrent,
+        ] {
             for url in ["http://user:PW@h:1", "user:PW@h:1"] {
                 let c = ResolvedDownloadClient {
                     provider: Some(provider),
@@ -924,5 +1130,334 @@ mod tests {
         assert!(err(&blank_key).contains("api_key"));
         assert!(err(&client(ClientProvider::Nzbget)).contains("url"));
         assert!(err(&client(ClientProvider::Blackhole)).contains("directory"));
+    }
+
+    fn deluge(url: &str) -> ResolvedDownloadClient {
+        ResolvedDownloadClient {
+            url: Some(url.into()),
+            username: Some("localclient".into()),
+            password: Some("PW".into()),
+            ..client(ClientProvider::Deluge)
+        }
+    }
+
+    #[test]
+    fn deluge_stores_bare_host_port_and_needs_credentials() {
+        for url in ["http://10.0.0.20:58846", "10.0.0.20:58846"] {
+            assert_eq!(
+                value(&deluge(url), "deluge_host"),
+                "10.0.0.20:58846",
+                "{url}"
+            );
+        }
+        for url in [
+            "10.0.0.20",
+            "10.0.0.20:",
+            "http://10.0.0.20:",
+            "http://10.0.0.20",
+        ] {
+            let e = err(&deluge(url));
+            assert!(e.contains("port"), "{url}: {e}");
+        }
+        for url in [
+            "http://10.0.0.20:58846/x",
+            "10.0.0.20:58846?a=1",
+            "10.0.0.20:58846#f",
+        ] {
+            let e = err(&deluge(url));
+            assert!(e.contains("without a path"), "{url}: {e}");
+        }
+        assert_eq!(
+            value(&deluge("http://10.0.0.20:80"), "deluge_host"),
+            "10.0.0.20:80"
+        );
+        assert_eq!(
+            value(&deluge("10.0.0.20:80"), "deluge_host"),
+            "10.0.0.20:80"
+        );
+        for url in ["http://[fd00::20]:58846", "[fd00::20]:58846"] {
+            let e = err(&deluge(url));
+            assert!(e.contains("IPv6"), "{url}: {e}");
+        }
+        for c in [
+            ResolvedDownloadClient {
+                username: None,
+                ..deluge("10.0.0.20:58846")
+            },
+            ResolvedDownloadClient {
+                password: None,
+                ..deluge("10.0.0.20:58846")
+            },
+        ] {
+            assert!(err(&c).contains("username and password"));
+        }
+        assert_eq!(
+            value(&deluge("10.0.0.20:58846"), "deluge_download_directory"),
+            ""
+        );
+    }
+
+    #[test]
+    fn torrent_clients_select_themselves_and_enable_torrents() {
+        let c = ResolvedDownloadClient {
+            url: Some("http://10.0.0.16:8080".into()),
+            username: Some("admin".into()),
+            password: Some("PW".into()),
+            client_directory: Some("/downloads/torrents".into()),
+            ..client(ClientProvider::Qbittorrent)
+        };
+        let s = |key, value: &str| ("qBittorrent", key, value.to_string());
+        assert_eq!(
+            values(&c),
+            vec![
+                s("qbittorrent_host", "http://10.0.0.16:8080"),
+                s("qbittorrent_username", "admin"),
+                s("qbittorrent_password", "PW"),
+                s("qbittorrent_label", "comics"),
+                s("qbittorrent_folder", "/downloads/torrents"),
+                ("Client", "torrent_downloader", "5".to_string()),
+                ("Torrents", "enable_torrents", "True".to_string()),
+            ]
+        );
+        for (provider, selected) in [
+            (ClientProvider::Utorrent, "1"),
+            (ClientProvider::Rtorrent, "2"),
+            (ClientProvider::Transmission, "3"),
+            (ClientProvider::Deluge, "4"),
+        ] {
+            let c = ResolvedDownloadClient {
+                provider: Some(provider),
+                ..deluge("http://10.0.0.16:1")
+            };
+            assert_eq!(value(&c, "torrent_downloader"), selected, "{provider:?}");
+            assert_eq!(value(&c, "enable_torrents"), "True", "{provider:?}");
+        }
+        assert!(!values(&sab("http://10.0.0.15:8080", "K"))
+            .iter()
+            .any(|(_, k, _)| *k == "enable_torrents"));
+    }
+
+    #[test]
+    fn utorrent_host_keeps_its_path_and_gets_a_lowercase_scheme() {
+        let host = |url: &str| {
+            value(
+                &ResolvedDownloadClient {
+                    url: Some(url.into()),
+                    ..client(ClientProvider::Utorrent)
+                },
+                "utorrent_host",
+            )
+        };
+        for (url, stored) in [
+            ("10.0.0.18:8080", "http://10.0.0.18:8080"),
+            ("10.0.0.18:8080/gui/", "http://10.0.0.18:8080/gui/"),
+            ("HTTP://10.0.0.18:8080/", "http://10.0.0.18:8080/"),
+            ("httpbox:8080", "http://httpbox:8080"),
+            (
+                "http://10.0.0.18:8080/gui/gui",
+                "http://10.0.0.18:8080/gui/gui",
+            ),
+            (
+                "https://u.example/utorrent/gui//",
+                "https://u.example/utorrent/gui//",
+            ),
+        ] {
+            assert_eq!(host(url), stored, "{url}");
+        }
+        let refused = |url: &str| {
+            err(&ResolvedDownloadClient {
+                url: Some(url.into()),
+                ..client(ClientProvider::Utorrent)
+            })
+        };
+        for url in ["http://10.0.0.18:8080/gui/?token=x", "10.0.0.18:8080#f"] {
+            assert!(refused(url).contains("query or fragment"), "{url}");
+        }
+        assert!(refused("ftp://10.0.0.18:21").contains("http://"));
+    }
+
+    #[test]
+    fn torrent_fields_refuse_control_characters_the_url_parser_drops() {
+        let qbit = ResolvedDownloadClient {
+            url: Some("http://10.0.0.16:8080/q\tb".into()),
+            ..client(ClientProvider::Qbittorrent)
+        };
+        let transmission = ResolvedDownloadClient {
+            url: Some("http://10.0.0.15:9091/custom\n/rpc".into()),
+            ..client(ClientProvider::Transmission)
+        };
+        let dir = ResolvedDownloadClient {
+            url: Some("http://10.0.0.16:8080".into()),
+            client_directory: Some("/data/\ntorrents".into()),
+            ..client(ClientProvider::Qbittorrent)
+        };
+        let watch = ResolvedDownloadClient {
+            directory: Some("/watch\r".into()),
+            ..client(ClientProvider::Watchdir)
+        };
+        for (field, c) in [
+            ("url", qbit),
+            ("url", transmission),
+            ("client_directory", dir),
+            ("directory", watch),
+        ] {
+            let e = err(&c);
+            assert!(e.contains(field) && e.contains("control"), "{field}: {e}");
+        }
+    }
+
+    #[test]
+    fn qbittorrent_url_refuses_a_query_or_fragment() {
+        for url in ["http://10.0.0.16:8080/?x=1", "http://10.0.0.16:8080#f"] {
+            let c = ResolvedDownloadClient {
+                url: Some(url.into()),
+                ..client(ClientProvider::Qbittorrent)
+            };
+            assert!(err(&c).contains("query or fragment"), "{url}");
+        }
+    }
+
+    fn transmission(url: &str) -> ResolvedDownloadClient {
+        ResolvedDownloadClient {
+            url: Some(url.into()),
+            ..client(ClientProvider::Transmission)
+        }
+    }
+
+    #[test]
+    fn transmission_gets_its_rpc_path_unless_one_is_given() {
+        let host = |url: &str| value(&transmission(url), "transmission_host");
+        assert_eq!(
+            host("http://10.0.0.15:9091"),
+            "http://10.0.0.15:9091/transmission/rpc"
+        );
+        assert_eq!(
+            host("http://10.0.0.15:9091/"),
+            "http://10.0.0.15:9091/transmission/rpc"
+        );
+        assert_eq!(
+            host("https://t.example/custom/rpc"),
+            "https://t.example/custom/rpc"
+        );
+        for url in ["http://t:9091?x=1", "http://t:9091/rpc#f"] {
+            let e = err(&transmission(url));
+            assert!(e.contains("query or fragment"), "{url}: {e}");
+        }
+        let c = transmission("http://10.0.0.15:9091");
+        assert_eq!(value(&c, "transmission_username"), "None");
+        assert_eq!(value(&c, "transmission_directory"), "None");
+    }
+
+    #[test]
+    fn rtorrent_splits_the_rpc_path_out_of_the_host() {
+        let c = |url: &str| ResolvedDownloadClient {
+            url: Some(url.into()),
+            ..client(ClientProvider::Rtorrent)
+        };
+        let rt = c("https://rt.example:8443/user/RPC2");
+        assert_eq!(value(&rt, "rtorrent_host"), "https://rt.example:8443");
+        assert_eq!(value(&rt, "rtorrent_rpc_url"), "user/RPC2");
+        let rt = c("http://10.0.0.17:5000/");
+        assert_eq!(value(&rt, "rtorrent_host"), "http://10.0.0.17:5000");
+        assert_eq!(value(&rt, "rtorrent_rpc_url"), "None");
+        assert!(err(&c("scgi://10.0.0.17:5000")).contains("http"));
+        assert!(err(&c("10.0.0.17:5000")).contains("scheme"));
+        assert!(err(&c("http://10.0.0.17:5000/RPC2?x=1")).contains("query"));
+    }
+
+    #[test]
+    fn torrent_urls_need_http_where_mylar_does() {
+        for provider in [ClientProvider::Qbittorrent, ClientProvider::Transmission] {
+            for url in ["ftp://h:1", "h.example:1"] {
+                let c = ResolvedDownloadClient {
+                    provider: Some(provider),
+                    url: Some(url.into()),
+                    ..Default::default()
+                };
+                assert!(err(&c).contains("http"), "{provider:?} {url}");
+            }
+        }
+    }
+
+    #[test]
+    fn directories_split_by_whose_view_they_are() {
+        let c = ResolvedDownloadClient {
+            url: Some("http://10.0.0.16:8080".into()),
+            directory: Some("/mylar/downloads".into()),
+            client_directory: Some("/data/torrents".into()),
+            ..client(ClientProvider::Qbittorrent)
+        };
+        assert_eq!(value(&c, "qbittorrent_folder"), "/data/torrents");
+        assert_eq!(try_map(&c).unwrap().ignored, vec!["directory".to_string()]);
+
+        let c = ResolvedDownloadClient {
+            client_directory: Some("/data/complete".into()),
+            ..sab("http://10.0.0.15:8080", "K")
+        };
+        assert_eq!(value(&c, "sab_directory"), "/downloads/complete");
+        assert_eq!(
+            try_map(&c).unwrap().ignored,
+            vec!["client_directory".to_string()]
+        );
+    }
+
+    #[test]
+    fn watchdir_needs_a_directory_and_reports_ignored_fields() {
+        let c = ResolvedDownloadClient {
+            url: Some("http://unused:1".into()),
+            directory: Some("/watch".into()),
+            ..client(ClientProvider::Watchdir)
+        };
+        let m = try_map(&c).unwrap();
+        assert_eq!(
+            values(&c),
+            vec![
+                ("Watchdir", "local_watchdir", "/watch".to_string()),
+                ("Watchdir", "torrent_local", "True".to_string()),
+                ("Client", "torrent_downloader", "0".to_string()),
+                ("Torrents", "enable_torrents", "True".to_string()),
+            ]
+        );
+        assert_eq!(m.ignored, vec!["url".to_string()]);
+        assert!(err(&client(ClientProvider::Watchdir)).contains("directory"));
+
+        let c = ResolvedDownloadClient {
+            category: Some("comics".into()),
+            priority: Some("High".into()),
+            ..transmission("http://10.0.0.15:9091")
+        };
+        assert_eq!(
+            try_map(&c).unwrap().ignored,
+            vec!["category".to_string(), "priority".to_string()]
+        );
+    }
+
+    #[test]
+    fn torrent_passwords_are_encrypted_when_mylar_encrypts_them() {
+        let on = ini(&[("encrypt_passwords", "True")]);
+        for provider in [
+            ClientProvider::Qbittorrent,
+            ClientProvider::Deluge,
+            ClientProvider::Transmission,
+            ClientProvider::Rtorrent,
+            ClientProvider::Utorrent,
+        ] {
+            let c = ResolvedDownloadClient {
+                provider: Some(provider),
+                ..deluge("http://10.0.0.16:1")
+            };
+            let m = map(&on, &c).unwrap();
+            let pw = m
+                .settings
+                .iter()
+                .find(|s| s.key.ends_with("_password"))
+                .unwrap();
+            assert_eq!(
+                secret::decode(&pw.value).as_deref(),
+                Some("PW"),
+                "{provider:?}"
+            );
+            assert!(!format!("{m:?}").contains(&pw.value), "{provider:?}");
+        }
     }
 }
