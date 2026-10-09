@@ -18,6 +18,7 @@ pub struct Edit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditError {
     Section(String),
+    /// Only the text before any `=`/`:`, so a mistyped `key=secret` isn't echoed.
     Key(String),
     /// Names the key, not the value: values can be secrets.
     Value {
@@ -60,7 +61,8 @@ fn validate(e: &Edit) -> Result<(), EditError> {
         || e.key.contains(['=', ':'])
         || e.key.starts_with(['#', ';', '['])
     {
-        return Err(EditError::Key(e.key.clone()));
+        let shown = e.key.split(['=', ':']).next().unwrap_or_default();
+        return Err(EditError::Key(shown.to_string()));
     }
     // configparser strips values on read, so edge whitespace would not survive.
     if breaks(&e.value) || e.value.trim() != e.value {
@@ -419,8 +421,8 @@ mod tests {
             ),
             (edit("Gen]", "k", "v"), EditError::Section("Gen]".into())),
             (edit("General", "", "v"), EditError::Key("".into())),
-            (edit("General", "a=b", "v"), EditError::Key("a=b".into())),
-            (edit("General", "a:b", "v"), EditError::Key("a:b".into())),
+            (edit("General", "a=b", "v"), EditError::Key("a".into())),
+            (edit("General", "a:b", "v"), EditError::Key("a".into())),
             (edit("General", "k\r", "v"), EditError::Key("k\r".into())),
             (edit("General", " k", "v"), EditError::Key(" k".into())),
             (edit("General", "k\t", "v"), EditError::Key("k\t".into())),
@@ -449,6 +451,8 @@ mod tests {
     #[test]
     fn a_rejected_value_is_not_echoed() {
         let err = rewrite(SAMPLE, &[edit("General", "nzb_password", "pa\nSECRETPW")]).unwrap_err();
+        assert!(!format!("{err} {err:?}").contains("SECRETPW"));
+        let err = rewrite(SAMPLE, &[edit("General", "nzb_password=SECRETPW", "v")]).unwrap_err();
         assert!(!format!("{err} {err:?}").contains("SECRETPW"));
     }
 
