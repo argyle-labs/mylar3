@@ -444,8 +444,10 @@ fn bool_word(v: &str) -> Option<&'static str> {
     }
 }
 
-/// The value Mylar stores for `key` posted as `target`: `process_kwargs`'
-/// type coercion, then the rewrites `config.configure()` applies on every save.
+/// `key`'s value as Mylar uses it: `process_kwargs`' type coercion, then the
+/// rewrites `config.configure()` applies on every save. Most rewrites stay in
+/// memory while `config.ini` (and `/getConfig`) keep the posted text, so saved
+/// and target values compare through this on both sides.
 pub fn stored_form(key: &str, target: &str) -> String {
     let mut v = target.to_string();
     if BOOL_KEYS.binary_search(&key).is_ok() {
@@ -491,9 +493,15 @@ pub fn stored_form(key: &str, target: &str) -> String {
     v
 }
 
-/// Whether `ini` already stores `key` as Mylar would store `target`.
+/// Whether `ini` already holds a value for `key` equivalent to `target`.
 pub fn is_stored(ini: &ConfigIni, key: &str, target: &str) -> bool {
-    ini.0.get(key).map(|v| normalized(v)) == Some(normalized(&stored_form(key, target)))
+    ini.0
+        .get(key)
+        .is_some_and(|v| canonical(key, v) == canonical(key, target))
+}
+
+fn canonical(key: &str, v: &str) -> Vec<u8> {
+    normalized(&stored_form(key, v)).into_owned()
 }
 
 /// Values compare by plaintext: an encrypted value is re-salted on every save.
@@ -547,7 +555,7 @@ fn changed<'a>(before: &'a ConfigIni, after: &'a ConfigIni, planned: &[&str]) ->
         .map(String::as_str)
         .filter(|k| !planned.contains(k))
         .filter(|k| {
-            before.0.get(*k).map(|v| normalized(v)) != after.0.get(*k).map(|v| normalized(v))
+            before.0.get(*k).map(|v| canonical(k, v)) != after.0.get(*k).map(|v| canonical(k, v))
         })
         .collect()
 }
@@ -568,7 +576,7 @@ pub(crate) fn diff(before: &ConfigIni, after: &ConfigIni, planned: &[&str]) -> V
         .collect()
 }
 
-/// Planned keys whose stored value is not [`stored_form`] of the target.
+/// Planned keys whose saved value is not equivalent to the target.
 fn unlanded(after: &ConfigIni, changes: &[SettingChange]) -> Vec<String> {
     changes
         .iter()
@@ -1040,18 +1048,26 @@ mod tests {
     }
 
     #[test]
-    fn landed_values_compare_in_stored_form() {
+    fn landed_values_compare_by_equivalence() {
+        // `config.ini` keeps sab_host as posted; the rewrite is in memory only.
         let after = ini(&table(&[
-            ("sab_host", "http://10.0.0.5:8080"),
+            ("sab_host", "http://10.0.0.5:8080/"),
             ("sab_apikey", "^~$z$S0VZMXNhbHRzYWx0"),
             ("sab_to_mylar", "True"),
+            ("sab_priority", "3"),
         ]));
         let ok = [
-            change("sab_host", "10.0.0.5:8080/"),
+            change("sab_host", "http://10.0.0.5:8080/"),
             change("sab_apikey", "KEY1"),
             change("sab_to_mylar", "1"),
+            change("sab_priority", "3"),
         ];
         assert!(unlanded(&after, &ok).is_empty());
+        let equivalent = [
+            change("sab_host", "10.0.0.5:8080"),
+            change("sab_priority", "High"),
+        ];
+        assert!(unlanded(&after, &equivalent).is_empty());
         let bad = [change("sab_apikey", "OTHER"), change("sab_directory", "/x")];
         let missed = unlanded(&after, &bad);
         assert_eq!(
@@ -1120,6 +1136,26 @@ mod tests {
         r.extra = "7030#8000".into();
         stored.torznab.push(r);
         assert!(rows_unlanded(&spaced, &stored).is_empty());
+    }
+
+    #[test]
+    fn equivalent_rewrites_are_not_moves() {
+        let before = ini(&table(&[("gotify_server_url", "https://g")]));
+        let after = ini(&table(&[("gotify_server_url", "https://g/")]));
+        assert!(diff(&before, &after, &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_verifies_a_value_saved_as_posted() {
+        let before = table(&[]);
+        let after = table(&[("sab_host", "http://10.0.0.99:8080/")]);
+        let server = server(&[before.clone(), after], ok()).await;
+        let b = ini(&before);
+        let w = Write {
+            changes: vec![change("sab_host", "http://10.0.0.99:8080/")],
+            providers: Providers::parse(&b).unwrap(),
+        };
+        apply(&mylar(&server), &b, &w).await.unwrap();
     }
 
     #[tokio::test]
