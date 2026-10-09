@@ -15,6 +15,7 @@ const FORM_CHECKBOXES: &[&str] = &[
     "enable_https",
     "launch_browser",
     "backup_on_start",
+    "keep_html_cache",
     "syno_fix",
     "auto_update",
     "annuals_on",
@@ -27,6 +28,7 @@ const FORM_CHECKBOXES: &[&str] = &[
     "rtorrent_ssl",
     "rtorrent_verify",
     "rtorrent_startonload",
+    "qbittorrent_ignore_ssl",
     "enable_torrents",
     "enable_rss",
     "experimental",
@@ -100,6 +102,8 @@ const FORM_CHECKBOXES: &[&str] = &[
     "opds_pagesize",
     "enable_ddl",
     "enable_getcomics",
+    "enable_airdcpp",
+    "jd2_enable",
     "enable_external_server",
     "ddl_prefer_upscaled",
     "deluge_pause",
@@ -119,6 +123,11 @@ const PROVIDER_LISTS: &[(&str, &str, [&str; 6])] = &[
         ["name", "host", "verify", "apikey", "category", "enabled"],
     ),
 ];
+
+/// Keys an older Mylar defined and v0.11.0 dropped. v0.11.0 never deletes them
+/// from `config.ini`, so upgraded instances still serve them; nothing reads them,
+/// so they are neither a form difference nor re-posted.
+const RETIRED_KEYS: &[&str] = &["host_return"];
 
 /// Secret-bearing keys `scrub::is_sensitive_key` does not recognise.
 const MYLAR_SECRETS: &[&str] = &[
@@ -238,17 +247,17 @@ pub fn form(ini: &ConfigIni, changes: &[SettingChange]) -> Result<Vec<(String, S
             missing.join(", ")
         );
     }
-    // A key outside v0.8.3's definitions may be a checkbox another version's
-    // form has, which this re-post would turn off; a stale legacy key also trips this.
+    // A key outside v0.11.0's definitions may be a checkbox another version's
+    // form has, which this re-post would turn off.
     let unknown: Vec<&str> = ini
         .0
         .keys()
         .map(String::as_str)
-        .filter(|k| CONFIG_KEYS.binary_search(k).is_err())
+        .filter(|k| CONFIG_KEYS.binary_search(k).is_err() && !RETIRED_KEYS.contains(k))
         .collect();
     if !unknown.is_empty() {
         bail!(
-            "this Mylar's settings hold keys mylar3 v0.8.3 does not define [{}]; its form may differ from the one this tool re-posts",
+            "this Mylar's settings hold keys Mylar v0.11.0 does not define [{}]; its form may differ from the one this tool re-posts",
             unknown.join(", ")
         );
     }
@@ -574,9 +583,9 @@ mod tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// `checked_configs` from mylar3 v0.8.3 `mylar/webserve.py`, verbatim.
-    const UPSTREAM_V083: &str = r#"['enable_https', 'launch_browser', 'backup_on_start', 'syno_fix', 'auto_update', 'annuals_on', 'api_enabled', 'nzb_startup_search',
-'enforce_perms', 'sab_to_mylar', 'torrent_local', 'torrent_seedbox', 'rtorrent_ssl', 'rtorrent_verify', 'rtorrent_startonload',
+    /// `checked_configs` from Mylar v0.11.0 `mylar/webserve.py`, verbatim.
+    const UPSTREAM_V0110: &str = r#"['enable_https', 'launch_browser', 'backup_on_start', 'keep_html_cache', 'syno_fix', 'auto_update', 'annuals_on', 'api_enabled', 'nzb_startup_search',
+'enforce_perms', 'sab_to_mylar', 'torrent_local', 'torrent_seedbox', 'rtorrent_ssl', 'rtorrent_verify', 'rtorrent_startonload', 'qbittorrent_ignore_ssl',
 'enable_torrents', 'enable_rss', 'experimental', 'enable_torrent_search', 'enable_32p', 'enable_torznab',
 'newznab', 'use_minsize', 'use_maxsize', 'ddump', 'failed_download_handling', 'sab_client_post_processing', 'nzbget_client_post_processing',
 'failed_auto', 'post_processing', 'enable_check_folder', 'enable_pre_scripts', 'enable_snatch_script', 'enable_extra_scripts',
@@ -586,7 +595,7 @@ mod tests {
 'prowl_enabled', 'prowl_onsnatch', 'pushover_enabled', 'pushover_onsnatch', 'pushover_image', 'mattermost_enabled', 'mattermost_onsnatch', 'boxcar_enabled',
 'boxcar_onsnatch', 'pushbullet_enabled', 'pushbullet_onsnatch', 'telegram_enabled', 'telegram_onsnatch', 'telegram_image', 'discord_enabled', 'discord_onsnatch', 'slack_enabled', 'slack_onsnatch',
 'email_enabled', 'email_enc', 'email_ongrab', 'email_onpost', 'gotify_enabled', 'gotify_server_url', 'gotify_token', 'gotify_onsnatch', 'opds_enable', 'opds_authentication', 'opds_metainfo', 'opds_pagesize', 'enable_ddl',
-'enable_getcomics', 'enable_external_server', 'ddl_prefer_upscaled', 'deluge_pause']"#;
+'enable_getcomics', 'enable_airdcpp', 'jd2_enable', 'enable_external_server', 'ddl_prefer_upscaled', 'deluge_pause']"#;
 
     /// A full, non-minimal settings table: every checkbox, two newznabs, one
     /// torznab, a library and download folders.
@@ -734,9 +743,9 @@ mod tests {
     }
 
     #[test]
-    fn checkbox_list_matches_upstream_v083() {
-        let mut upstream: Vec<&str> = UPSTREAM_V083.split('\'').skip(1).step_by(2).collect();
-        assert_eq!(upstream.len(), 91);
+    fn checkbox_list_matches_upstream_v0110() {
+        let mut upstream: Vec<&str> = UPSTREAM_V0110.split('\'').skip(1).step_by(2).collect();
+        assert_eq!(upstream.len(), 95);
         let mut ours = FORM_CHECKBOXES.to_vec();
         upstream.sort_unstable();
         ours.sort_unstable();
@@ -757,8 +766,12 @@ mod tests {
 
     #[tokio::test]
     async fn execute_fixes_retention_and_reposts_the_whole_form() {
-        let before = table(&[]);
-        let after = table(&[("usenet_retention", "6000")]);
+        let before = table(&[("keep_html_cache", "True"), ("jd2_enable", "True")]);
+        let after = table(&[
+            ("keep_html_cache", "True"),
+            ("jd2_enable", "True"),
+            ("usenet_retention", "6000"),
+        ]);
         let server = server(&[before.clone(), before.clone(), after], ok()).await;
         let r = configure("m", &mylar(&server), None, true).await.unwrap();
         assert!(r.applied && r.verified && !r.dry_run, "{r:?}");
@@ -921,9 +934,24 @@ mod tests {
         let err = form(&ini(&rows), &c).unwrap_err().to_string();
         assert!(err.contains("deluge_pause"), "{err}");
 
-        let rows = table(&[("jd2_enable", "False"), ("nzbsu_apikey", "x")]);
+        let mut rows = table(&[]);
+        for k in [
+            "keep_html_cache",
+            "qbittorrent_ignore_ssl",
+            "enable_airdcpp",
+            "jd2_enable",
+        ] {
+            unset(&mut rows, k);
+        }
         let err = form(&ini(&rows), &c).unwrap_err().to_string();
-        assert!(err.contains("[jd2_enable, nzbsu_apikey]"), "{err}");
+        assert!(
+            err.contains("[keep_html_cache, qbittorrent_ignore_ssl, enable_airdcpp, jd2_enable]"),
+            "{err}"
+        );
+
+        let rows = table(&[("host_return", "x"), ("nzbsu_apikey", "x")]);
+        let err = form(&ini(&rows), &c).unwrap_err().to_string();
+        assert!(err.contains("[nzbsu_apikey]"), "{err}");
         assert!(FORM_CHECKBOXES
             .iter()
             .all(|k| CONFIG_KEYS.binary_search(k).is_ok()));
@@ -939,6 +967,23 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("minimal_ini"));
+    }
+
+    #[test]
+    fn form_accepts_an_upgraded_instance() {
+        let c = [change("usenet_retention", "6000")];
+        let mut rows = table(&[]);
+        for k in CONFIG_KEYS {
+            if !rows.iter().any(|(key, _)| key == k) {
+                rows.push((k.to_string(), "None".to_string()));
+            }
+        }
+        set(&mut rows, "host_return", "None");
+        let fields = form(&ini(&rows), &c).unwrap();
+        assert!(!fields.iter().any(|(k, _)| k == "host_return"));
+        assert!(RETIRED_KEYS
+            .iter()
+            .all(|k| CONFIG_KEYS.binary_search(k).is_err()));
     }
 
     #[test]

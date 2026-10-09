@@ -1,9 +1,17 @@
-//! Every option mylar3 v0.8.3 defines (`_CONFIG_DEFINITIONS` in
+//! Every option Mylar v0.11.0 defines (`_CONFIG_DEFINITIONS` in
 //! `mylar/config.py`), lowercased as `config.ini` and `/getConfig` name them.
 
 pub const CONFIG_KEYS: &[&str] = &[
     "add_comics",
     "add_to_csv",
+    "airdcpp_announce_bots",
+    "airdcpp_announce_hub",
+    "airdcpp_download_dir",
+    "airdcpp_host",
+    "airdcpp_hubs",
+    "airdcpp_password",
+    "airdcpp_username",
+    "airdcpp_version",
     "alphaindex",
     "alt_pull",
     "alternate_latest_series_covers",
@@ -54,6 +62,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "comic_cover_local",
     "comic_dir",
     "comicvine_api",
+    "comicvine_url",
     "config_version",
     "copy2arcdir",
     "correct_metadata",
@@ -64,6 +73,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "ct_settingspath",
     "ct_tag_cbl",
     "ct_tag_cr",
+    "custom_issue_exceptions",
     "cv_batch_limit_protection",
     "cv_batch_limit_threshold",
     "cv_onetimer",
@@ -108,6 +118,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "email_to",
     "email_user",
     "enable_32p",
+    "enable_airdcpp",
     "enable_check_folder",
     "enable_ddl",
     "enable_external_server",
@@ -154,7 +165,6 @@ pub const CONFIG_KEYS: &[&str] = &[
     "gotify_token",
     "grabbag_dir",
     "highcount",
-    "host_return",
     "http_host",
     "http_password",
     "http_port",
@@ -178,7 +188,12 @@ pub const CONFIG_KEYS: &[&str] = &[
     "imp_seriesfolders",
     "imprint_mapping_type",
     "indie_pub",
+    "instance_name",
     "interface",
+    "jd2_dest_dir",
+    "jd2_enable",
+    "jd2_url",
+    "keep_html_cache",
     "launch_browser",
     "local_torrent_pp",
     "local_watchdir",
@@ -258,15 +273,18 @@ pub const CONFIG_KEYS: &[&str] = &[
     "pushover_image",
     "pushover_onsnatch",
     "pushover_priority",
+    "pushover_sound",
     "pushover_userkey",
     "qbittorrent_folder",
     "qbittorrent_host",
+    "qbittorrent_ignore_ssl",
     "qbittorrent_label",
     "qbittorrent_loadaction",
     "qbittorrent_password",
     "qbittorrent_username",
     "read2filename",
     "refresh_cache",
+    "release_provider_url",
     "rename_files",
     "replace_char",
     "replace_spaces",
@@ -373,12 +391,12 @@ pub const CONFIG_KEYS: &[&str] = &[
 mod tests {
     use super::*;
 
-    /// sha256 of the v0.8.3 key names, sorted and newline-joined.
-    const V083_SHA256: &str = "c7b5e07fd985362004836cb4d1bbb090c69b68f9ee6c2826fe375818e43ba2ad";
+    /// sha256 of the v0.11.0 key names, sorted and newline-joined.
+    const V0110_SHA256: &str = "a20bedff8feaef7634bd87ba5a64370d8600f49d5f798db6508ebe110e06c79c";
 
     #[test]
-    fn keys_match_upstream_v083() {
-        assert_eq!(CONFIG_KEYS.len(), 365);
+    fn keys_match_upstream_v0110() {
+        assert_eq!(CONFIG_KEYS.len(), 383);
         assert!(
             CONFIG_KEYS.windows(2).all(|w| w[0] < w[1]),
             "sorted and unique"
@@ -386,7 +404,7 @@ mod tests {
         let joined = CONFIG_KEYS.join("\n");
         assert_eq!(
             plugin_toolkit::hash::sha256_hex(joined.as_bytes()),
-            V083_SHA256
+            V0110_SHA256
         );
     }
 }

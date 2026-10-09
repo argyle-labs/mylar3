@@ -46,9 +46,9 @@ podman run -d --name mylar3 --restart unless-stopped \
     lscr.io/linuxserver/mylar3:latest
 ```
 
-**LXC** — on a container-capable LXC (e.g. a Proxmox LXC with nesting enabled) run the same image via Docker/Podman as above, or install mylar3 from upstream directly on the guest: <https://github.com/mylar3/mylar3>.
+**LXC** — on a container-capable LXC (e.g. a Proxmox LXC with nesting enabled) run the same image via Docker/Podman as above, or install mylar3 from upstream directly on the guest: <https://github.com/MylarComics/mylar3>.
 
-**VM** — install mylar3 from upstream (<https://github.com/mylar3/mylar3>) or run the same container image inside the VM; expose port `8090`.
+**VM** — install mylar3 from upstream (<https://github.com/MylarComics/mylar3>) or run the same container image inside the VM; expose port `8090`.
 
 **Unraid** — add via *Community Applications*, or *Docker → Add Container* with image `lscr.io/linuxserver/mylar3:latest`, port `8090`, and the volume paths above.
 
@@ -57,7 +57,7 @@ podman run -d --name mylar3 --restart unless-stopped \
 | | |
 |---|---|
 | Default port | `8090` |
-| Upstream | <https://github.com/mylar3/mylar3> |
+| Upstream | <https://github.com/MylarComics/mylar3> |
 | Operator notes | [mylar3.md](docs/mylar3.md) |
 
 
@@ -90,7 +90,7 @@ orca mylar3.backlog.process --name comics --folder /downloads/completed/comics -
 Mylar has no per-setting write: `mylar3.configure --execute` submits the web
 settings form with every checkbox and newznab/torznab provider re-posted at its
 current value. It refuses when this Mylar's form does not match the one it
-knows (missing checkboxes or keys v0.8.3 does not define, `minimal_ini` not
+knows (missing checkboxes or keys v0.11.0 does not define, `minimal_ini` not
 False), fails if the settings changed since the plan, and fails, listing what
 moved, if anything besides the planned changes moved on write. Without `--usenet-retention` it only
 raises retention below 6000. `backlog.process` only accepts a folder inside

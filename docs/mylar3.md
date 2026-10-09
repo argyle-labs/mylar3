@@ -5,7 +5,7 @@ Comics library manager. Monitors and organizes your comic library.
 - **Port**: 8090
 - **Image**: `lscr.io/linuxserver/mylar3:latest`
 - **Compose**: [compose.yml](../compose.yml)
-- **Upstream**: <https://github.com/mylar3/mylar3>
+- **Upstream**: <https://github.com/MylarComics/mylar3> (built against v0.11.0)
 
 ## Notes
 
