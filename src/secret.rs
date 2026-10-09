@@ -7,10 +7,10 @@ const SALT_LEN: usize = 8;
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// `secret` in Mylar's stored form, with a fresh salt.
-pub fn encode(secret: &str) -> String {
+pub fn encode(secret: &str) -> Result<String, getrandom::Error> {
     let mut salt = [0u8; SALT_LEN];
-    getrandom::fill(&mut salt).expect("OS random source unavailable");
-    encode_with_salt(secret, salt)
+    getrandom::fill(&mut salt)?;
+    Ok(encode_with_salt(secret, salt))
 }
 
 /// The plaintext of a stored value; `None` if it is not in Mylar's form.
@@ -45,8 +45,9 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Strict: Python's `b64decode` rejects bad padding but skips stray characters;
-/// rejecting those too only matters for values Mylar never writes.
+/// Strict: Python's `b64decode` rejects bad padding but skips stray characters
+/// and ignores nonzero trailing bits; rejecting those too only matters for
+/// values Mylar never writes.
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(4) {
         return None;
@@ -66,6 +67,9 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
             out.push((acc >> bits) as u8);
         }
     }
+    if acc & ((1 << bits) - 1) != 0 {
+        return None;
+    }
     Some(out)
 }
 
@@ -81,11 +85,11 @@ mod tests {
             "pä$$ wörd=/+",
             "a much longer api key 0123456789",
         ] {
-            let stored = encode(s);
+            let stored = encode(s).unwrap();
             assert!(stored.starts_with(PREFIX));
             assert_eq!(decode(&stored).as_deref(), Some(s));
         }
-        assert_ne!(encode("hunter2"), encode("hunter2"));
+        assert_ne!(encode("hunter2").unwrap(), encode("hunter2").unwrap());
     }
 
     #[test]
@@ -100,6 +104,15 @@ mod tests {
     }
 
     #[test]
+    fn decodes_a_vector_with_high_salt_bytes() {
+        // Python: base64.b64encode(b'hunter2' + bytes([0x80, 0xff, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0]))
+        let stored = "^~$z$aHVudGVyMoD/kKCwwNDg";
+        let salt = [0x80, 0xff, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0];
+        assert_eq!(decode(stored).as_deref(), Some("hunter2"));
+        assert_eq!(encode_with_salt("hunter2", salt), stored);
+    }
+
+    #[test]
     fn a_value_without_the_prefix_is_none() {
         assert_eq!(decode("aHVudGVyMsOpAQIDBAUGBwg="), None);
         assert_eq!(decode("hunter2"), None);
@@ -111,5 +124,7 @@ mod tests {
         assert_eq!(decode("^~$z$aHVudGVyMsOpAQIDBAUGBwg"), None);
         // Valid base64 shorter than the salt.
         assert_eq!(decode("^~$z$AAAA"), None);
+        // Non-canonical: the final `h` carries nonzero bits past the last byte.
+        assert_eq!(decode("^~$z$aHVudGVyMsOpAQIDBAUGBwh="), None);
     }
 }
