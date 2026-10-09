@@ -35,6 +35,7 @@ pub(crate) fn table(overrides: &[(&str, &str)]) -> Vec<(String, String)> {
             "NZBGeek, https://api.nzbgeek.info, 0, KEY1, , 1, 1, DOGnzb, https://api.dognzb.cr, 1, KEY2, 7030#7020, 0, 4",
         ),
         ("extra_torznabs", "Jackett, http://10.0.0.16:9117/api, 0, TKEY, 7030#8000, 1, 6"),
+        ("provider_order", "0, NZBGeek"),
     ] {
         set(&mut rows, k, v);
     }
