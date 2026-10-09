@@ -491,6 +491,11 @@ pub fn stored_form(key: &str, target: &str) -> String {
     v
 }
 
+/// Whether `ini` already stores `key` as Mylar would store `target`.
+pub fn is_stored(ini: &ConfigIni, key: &str, target: &str) -> bool {
+    ini.0.get(key).map(|v| normalized(v)) == Some(normalized(&stored_form(key, target)))
+}
+
 /// Values compare by plaintext: an encrypted value is re-salted on every save.
 fn normalized(v: &str) -> std::borrow::Cow<'_, [u8]> {
     let Some(b64) = v.strip_prefix(ENCRYPTED_PREFIX) else {
@@ -568,11 +573,11 @@ fn unlanded(after: &ConfigIni, changes: &[SettingChange]) -> Vec<String> {
     changes
         .iter()
         .filter_map(|c| {
-            let want = stored_form(&c.key, &c.target);
-            let got = after.0.get(&c.key);
-            if got.map(|v| normalized(v)) == Some(normalized(&want)) {
+            if is_stored(after, &c.key, &c.target) {
                 return None;
             }
+            let want = stored_form(&c.key, &c.target);
+            let got = after.0.get(&c.key);
             Some(if is_secret(&c.key) {
                 format!("{} (value withheld)", c.key)
             } else {
