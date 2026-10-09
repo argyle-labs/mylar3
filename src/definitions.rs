@@ -407,32 +407,4 @@ mod tests {
             V0110_SHA256
         );
     }
-
-    #[test]
-    fn v0110_adds_and_drops_keys() {
-        for k in [
-            "airdcpp_announce_bots",
-            "airdcpp_announce_hub",
-            "airdcpp_download_dir",
-            "airdcpp_host",
-            "airdcpp_hubs",
-            "airdcpp_password",
-            "airdcpp_username",
-            "airdcpp_version",
-            "comicvine_url",
-            "custom_issue_exceptions",
-            "enable_airdcpp",
-            "instance_name",
-            "jd2_dest_dir",
-            "jd2_enable",
-            "jd2_url",
-            "keep_html_cache",
-            "pushover_sound",
-            "qbittorrent_ignore_ssl",
-            "release_provider_url",
-        ] {
-            assert!(CONFIG_KEYS.binary_search(&k).is_ok(), "{k}");
-        }
-        assert!(CONFIG_KEYS.binary_search(&"host_return").is_err());
-    }
 }

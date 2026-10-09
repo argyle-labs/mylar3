@@ -1,7 +1,7 @@
 //! A download client orca resolved (orca#796) mapped to the `config.ini` values
-//! Mylar v0.11.0 reads (unchanged since v0.8.3). A direct ini write skips
-//! Mylar's save-time fixups, so each value is the one Mylar itself would leave
-//! after a save. Indexers reach Mylar through Prowlarr, not here.
+//! Mylar v0.11.0 reads. A direct ini write skips Mylar's save-time fixups, so
+//! each value is the one Mylar itself would leave after a save. Indexers reach
+//! Mylar through Prowlarr, not here.
 
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::reqwest::Url;
