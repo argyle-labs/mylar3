@@ -124,6 +124,11 @@ const PROVIDER_LISTS: &[(&str, &str, [&str; 6])] = &[
     ),
 ];
 
+/// Keys an older Mylar defined and v0.11.0 dropped. v0.11.0 never deletes them
+/// from `config.ini`, so upgraded instances still serve them; nothing reads them,
+/// so they are neither a form difference nor re-posted.
+const RETIRED_KEYS: &[&str] = &["host_return"];
+
 /// Secret-bearing keys `scrub::is_sensitive_key` does not recognise.
 const MYLAR_SECRETS: &[&str] = &[
     "extra_newznabs",
@@ -243,12 +248,12 @@ pub fn form(ini: &ConfigIni, changes: &[SettingChange]) -> Result<Vec<(String, S
         );
     }
     // A key outside v0.11.0's definitions may be a checkbox another version's
-    // form has, which this re-post would turn off; a stale legacy key also trips this.
+    // form has, which this re-post would turn off.
     let unknown: Vec<&str> = ini
         .0
         .keys()
         .map(String::as_str)
-        .filter(|k| CONFIG_KEYS.binary_search(k).is_err())
+        .filter(|k| CONFIG_KEYS.binary_search(k).is_err() && !RETIRED_KEYS.contains(k))
         .collect();
     if !unknown.is_empty() {
         bail!(
@@ -946,7 +951,7 @@ mod tests {
 
         let rows = table(&[("host_return", "x"), ("nzbsu_apikey", "x")]);
         let err = form(&ini(&rows), &c).unwrap_err().to_string();
-        assert!(err.contains("[host_return, nzbsu_apikey]"), "{err}");
+        assert!(err.contains("[nzbsu_apikey]"), "{err}");
         assert!(FORM_CHECKBOXES
             .iter()
             .all(|k| CONFIG_KEYS.binary_search(k).is_ok()));
@@ -962,6 +967,23 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("minimal_ini"));
+    }
+
+    #[test]
+    fn form_accepts_an_upgraded_instance() {
+        let c = [change("usenet_retention", "6000")];
+        let mut rows = table(&[]);
+        for k in CONFIG_KEYS {
+            if !rows.iter().any(|(key, _)| key == k) {
+                rows.push((k.to_string(), "None".to_string()));
+            }
+        }
+        set(&mut rows, "host_return", "None");
+        let fields = form(&ini(&rows), &c).unwrap();
+        assert!(!fields.iter().any(|(k, _)| k == "host_return"));
+        assert!(RETIRED_KEYS
+            .iter()
+            .all(|k| CONFIG_KEYS.binary_search(k).is_err()));
     }
 
     #[test]
