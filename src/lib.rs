@@ -9,6 +9,7 @@
 pub mod api;
 mod definitions;
 pub mod execute;
+pub mod ini;
 pub mod remediate;
 pub mod secret;
 pub mod status;
