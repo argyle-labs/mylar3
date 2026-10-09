@@ -18,8 +18,12 @@ pub struct Edit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditError {
     Section(String),
+    /// Only the text before any `=`/`:`, so a mistyped `key=secret` isn't echoed.
     Key(String),
-    Value(String),
+    /// Names the key, not the value: values can be secrets.
+    Value {
+        key: String,
+    },
 }
 
 impl std::fmt::Display for EditError {
@@ -27,7 +31,7 @@ impl std::fmt::Display for EditError {
         match self {
             Self::Section(s) => write!(f, "invalid config.ini section name {s:?}"),
             Self::Key(k) => write!(f, "invalid config.ini key {k:?}"),
-            Self::Value(v) => write!(f, "invalid config.ini value {v:?}"),
+            Self::Value { key } => write!(f, "invalid config.ini value for key {key:?}"),
         }
     }
 }
@@ -57,11 +61,12 @@ fn validate(e: &Edit) -> Result<(), EditError> {
         || e.key.contains(['=', ':'])
         || e.key.starts_with(['#', ';', '['])
     {
-        return Err(EditError::Key(e.key.clone()));
+        let shown = e.key.split(['=', ':']).next().unwrap_or_default();
+        return Err(EditError::Key(shown.to_string()));
     }
     // configparser strips values on read, so edge whitespace would not survive.
     if breaks(&e.value) || e.value.trim() != e.value {
-        return Err(EditError::Value(e.value.clone()));
+        return Err(EditError::Value { key: e.key.clone() });
     }
     Ok(())
 }
@@ -416,8 +421,8 @@ mod tests {
             ),
             (edit("Gen]", "k", "v"), EditError::Section("Gen]".into())),
             (edit("General", "", "v"), EditError::Key("".into())),
-            (edit("General", "a=b", "v"), EditError::Key("a=b".into())),
-            (edit("General", "a:b", "v"), EditError::Key("a:b".into())),
+            (edit("General", "a=b", "v"), EditError::Key("a".into())),
+            (edit("General", "a:b", "v"), EditError::Key("a".into())),
             (edit("General", "k\r", "v"), EditError::Key("k\r".into())),
             (edit("General", " k", "v"), EditError::Key(" k".into())),
             (edit("General", "k\t", "v"), EditError::Key("k\t".into())),
@@ -426,15 +431,29 @@ mod tests {
             (edit("General", "[k", "v"), EditError::Key("[k".into())),
             (
                 edit("General", "k", "a\nb"),
-                EditError::Value("a\nb".into()),
+                EditError::Value { key: "k".into() },
             ),
-            (edit("General", "k", " v"), EditError::Value(" v".into())),
-            (edit("General", "k", "v\t"), EditError::Value("v\t".into())),
+            (
+                edit("General", "k", " v"),
+                EditError::Value { key: "k".into() },
+            ),
+            (
+                edit("General", "k", "v\t"),
+                EditError::Value { key: "k".into() },
+            ),
         ];
         for (e, err) in bad {
             let edits = [edit("General", "search_delay", "1"), e];
             assert_eq!(rewrite(SAMPLE, &edits), Err(err));
         }
+    }
+
+    #[test]
+    fn a_rejected_value_is_not_echoed() {
+        let err = rewrite(SAMPLE, &[edit("General", "nzb_password", "pa\nSECRETPW")]).unwrap_err();
+        assert!(!format!("{err} {err:?}").contains("SECRETPW"));
+        let err = rewrite(SAMPLE, &[edit("General", "nzb_password=SECRETPW", "v")]).unwrap_err();
+        assert!(!format!("{err} {err:?}").contains("SECRETPW"));
     }
 
     #[test]
