@@ -14,96 +14,176 @@ pub struct Edit {
     pub value: String,
 }
 
-/// `text` with every edit applied.
-pub fn rewrite(text: &str, edits: &[Edit]) -> String {
+/// An edit that configparser could not read back as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    Section(String),
+    Key(String),
+    Value(String),
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Section(s) => write!(f, "invalid config.ini section name {s:?}"),
+            Self::Key(k) => write!(f, "invalid config.ini key {k:?}"),
+            Self::Value(v) => write!(f, "invalid config.ini value {v:?}"),
+        }
+    }
+}
+
+impl std::error::Error for EditError {}
+
+/// `text` with every edit applied; nothing is applied if any edit is invalid.
+pub fn rewrite(text: &str, edits: &[Edit]) -> Result<String, EditError> {
+    for e in edits {
+        validate(e)?;
+    }
     let mut out = text.to_string();
     for e in edits {
         out = apply(&out, e);
     }
-    out
+    Ok(out)
 }
 
-/// The value of `key` in `[section]`, trimmed.
-pub fn get<'a>(text: &'a str, section: &str, key: &str) -> Option<&'a str> {
-    let mut current: Option<&str> = None;
-    for line in text.lines() {
-        if let Some(name) = header(line) {
-            current = Some(name);
+fn validate(e: &Edit) -> Result<(), EditError> {
+    let breaks = |s: &str| s.contains(['\r', '\n']);
+    if e.section.is_empty() || breaks(&e.section) || e.section.contains(']') {
+        return Err(EditError::Section(e.section.clone()));
+    }
+    if e.key.trim().is_empty() || breaks(&e.key) || e.key.contains(['=', ':']) {
+        return Err(EditError::Key(e.key.clone()));
+    }
+    // configparser strips values on read, so edge whitespace would not survive.
+    if breaks(&e.value) || e.value.trim() != e.value {
+        return Err(EditError::Value(e.value.clone()));
+    }
+    Ok(())
+}
+
+/// The value of `key` in `[section]` as configparser reads it: trimmed,
+/// continuation lines joined with `\n`, and `%%` unescaped to `%`.
+pub fn get(text: &str, section: &str, key: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let entry = entries(&lines)
+        .into_iter()
+        .find(|en| en.section == Some(section) && en.key.eq_ignore_ascii_case(key))?;
+    let first = lines[entry.line].split_once(['=', ':'])?.1.trim();
+    let mut value = vec![first];
+    value.extend(lines[entry.line + 1..entry.end].iter().map(|l| l.trim()));
+    Some(value.join("\n").replace("%%", "%"))
+}
+
+/// A `key = value` line and the lines its value spans.
+struct Entry<'a> {
+    section: Option<&'a str>,
+    key: &'a str,
+    line: usize,
+    /// One past the value's last non-blank continuation line.
+    end: usize,
+}
+
+/// A `[name]` header; configparser keeps the name's inner whitespace.
+fn header(line: &str) -> Option<&str> {
+    let name = line.trim().strip_prefix('[')?.strip_suffix(']')?;
+    (!name.is_empty()).then_some(name)
+}
+
+fn is_comment(line: &str) -> bool {
+    line.trim_start().starts_with(['#', ';'])
+}
+
+fn indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Every entry in `lines`, read with configparser's defaults. A non-blank line
+/// indented deeper than the key line continues the value, even across blank
+/// lines (`empty_lines_in_values`); a comment ends it.
+fn entries<'a>(lines: &[&'a str]) -> Vec<Entry<'a>> {
+    let mut out: Vec<Entry<'a>> = Vec::new();
+    let mut section = None;
+    let mut open: Option<usize> = None;
+    for (i, raw) in lines.iter().enumerate() {
+        let line = raw.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() {
             continue;
         }
-        if current != Some(section) || !is_entry(line) {
+        if is_comment(line) {
+            open = None;
             continue;
         }
-        if let Some((k, v)) = line.split_once(['=', ':']) {
-            if k.trim().eq_ignore_ascii_case(key) {
-                return Some(v.trim());
+        if let Some(at) = open {
+            if indent(line) > at {
+                if let Some(last) = out.last_mut() {
+                    last.end = i + 1;
+                }
+                continue;
             }
         }
+        open = None;
+        if let Some(name) = header(line) {
+            section = Some(name);
+            continue;
+        }
+        if let Some((k, _)) = line.split_once(['=', ':']) {
+            open = Some(indent(line));
+            out.push(Entry {
+                section,
+                key: k.trim(),
+                line: i,
+                end: i + 1,
+            });
+        }
     }
-    None
-}
-
-fn header(line: &str) -> Option<&str> {
-    let t = line.trim();
-    t.strip_prefix('[')?.strip_suffix(']').map(str::trim)
-}
-
-/// A `key = value` line: not blank, not a comment, not a continuation line.
-fn is_entry(line: &str) -> bool {
-    let t = line.trim_start();
-    !t.is_empty() && !t.starts_with('#') && !t.starts_with(';') && !line.starts_with([' ', '\t'])
+    out
 }
 
 fn apply(text: &str, e: &Edit) -> String {
     let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
     // Lines keep their own terminators so untouched lines round-trip exactly.
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let mut in_section = false;
-    // Index just past the section's last entry, where a missing key goes.
-    let mut section_end: Option<usize> = None;
-    for (i, line) in lines.iter().enumerate() {
+    // Mylar writes through BasicInterpolation, which reads `%%` as `%`.
+    let value = e.value.replace('%', "%%");
+    let found = entries(&lines);
+    let in_section: Vec<&Entry> = found
+        .iter()
+        .filter(|en| en.section == Some(e.section.as_str()))
+        .collect();
+    if let Some(en) = in_section
+        .iter()
+        .find(|en| en.key.eq_ignore_ascii_case(&e.key))
+    {
+        let line = lines[en.line];
         let body = line.trim_end_matches(['\r', '\n']);
-        if let Some(name) = header(body) {
-            in_section = name == e.section;
-            if in_section {
-                section_end = Some(i + 1);
+        let pos = body.find(['=', ':']).unwrap_or(body.len() - 1);
+        let after = &body[pos + 1..];
+        let mut gap = &after[..after.len() - after.trim_start().len()];
+        if gap.is_empty() && !value.is_empty() && body[..pos].ends_with([' ', '\t']) {
+            gap = " ";
+        }
+        let ending = &line[body.len()..];
+        let replaced = format!("{}{gap}{value}{ending}", &body[..=pos]);
+        let mut out = String::with_capacity(text.len());
+        for (j, l) in lines.iter().enumerate() {
+            if j == en.line {
+                out.push_str(&replaced);
+            } else if j < en.line || j >= en.end {
+                out.push_str(l);
             }
-            continue;
         }
-        if !in_section {
-            continue;
-        }
-        if !body.trim().is_empty() {
-            section_end = Some(i + 1);
-        }
-        let Some(pos) = body.find(['=', ':']).filter(|_| is_entry(body)) else {
-            continue;
-        };
-        if body[..pos].trim().eq_ignore_ascii_case(&e.key) {
-            let after = &body[pos + 1..];
-            let gap = &after[..after.len() - after.trim_start().len()];
-            let ending = &line[body.len()..];
-            let replaced = format!("{}{}{}{}", &body[..=pos], gap, e.value, ending);
-            // Indented lines after the entry continue its old value; configparser
-            // would join them onto the new one.
-            let continued = lines[i + 1..]
-                .iter()
-                .take_while(|l| l.starts_with([' ', '\t']) && !l.trim().is_empty())
-                .count();
-            let mut out = String::with_capacity(text.len());
-            for (j, l) in lines.iter().enumerate() {
-                if j == i {
-                    out.push_str(&replaced);
-                } else if j <= i || j > i + continued {
-                    out.push_str(l);
-                }
-            }
-            return out;
-        }
+        return out;
     }
     // configparser lowercases keys on write.
-    let entry = format!("{} = {}", e.key.to_ascii_lowercase(), e.value);
-    match section_end {
+    let entry = format!("{} = {value}", e.key.to_ascii_lowercase());
+    let header_line = lines
+        .iter()
+        .rposition(|l| header(l.trim_end_matches(['\r', '\n'])) == Some(e.section.as_str()));
+    let at = in_section
+        .last()
+        .map(|en| en.end)
+        .or(header_line.map(|h| h + 1));
+    match at {
         Some(at) => {
             let mut out = String::with_capacity(text.len() + entry.len() + 2);
             for (j, l) in lines.iter().enumerate() {
@@ -136,6 +216,10 @@ fn apply(text: &str, e: &Edit) -> String {
 mod tests {
     use super::*;
 
+    fn rw(text: &str, edits: &[Edit]) -> String {
+        rewrite(text, edits).unwrap()
+    }
+
     fn edit(section: &str, key: &str, value: &str) -> Edit {
         Edit {
             section: section.into(),
@@ -148,7 +232,7 @@ mod tests {
 
     #[test]
     fn replaces_only_the_target_value() {
-        let out = rewrite(SAMPLE, &[edit("Providers", "usenet_retention", "6000")]);
+        let out = rw(SAMPLE, &[edit("Providers", "usenet_retention", "6000")]);
         assert_eq!(
             out,
             SAMPLE.replace("usenet_retention = 3500", "usenet_retention = 6000")
@@ -158,24 +242,21 @@ mod tests {
     #[test]
     fn the_same_key_in_another_section_is_left_alone() {
         let text = "[A]\nk = 1\n[B]\nk = 2\n";
-        assert_eq!(
-            rewrite(text, &[edit("B", "k", "9")]),
-            "[A]\nk = 1\n[B]\nk = 9\n"
-        );
+        assert_eq!(rw(text, &[edit("B", "k", "9")]), "[A]\nk = 1\n[B]\nk = 9\n");
     }
 
     #[test]
     fn keeps_the_lines_own_spacing_and_line_endings() {
         let text = "[General]\r\nsearch_delay=5\r\nx = y\r\n";
         assert_eq!(
-            rewrite(text, &[edit("General", "search_delay", "1")]),
+            rw(text, &[edit("General", "search_delay", "1")]),
             "[General]\r\nsearch_delay=1\r\nx = y\r\n"
         );
     }
 
     #[test]
     fn a_missing_key_joins_the_end_of_its_section() {
-        let out = rewrite(SAMPLE, &[edit("General", "dynamic_update", "0")]);
+        let out = rw(SAMPLE, &[edit("General", "dynamic_update", "0")]);
         assert_eq!(
             out,
             SAMPLE.replace(
@@ -183,7 +264,7 @@ mod tests {
                 "search_delay = 5\ndynamic_update = 0\n"
             )
         );
-        let out = rewrite(
+        let out = rw(
             "[Client]\nnzb_downloader = 3",
             &[edit("Client", "sab_host", "h")],
         );
@@ -192,7 +273,7 @@ mod tests {
 
     #[test]
     fn a_missing_section_is_appended() {
-        let out = rewrite(
+        let out = rw(
             "[General]\na = 1\n",
             &[edit("Providers", "usenet_retention", "6000")],
         );
@@ -200,20 +281,20 @@ mod tests {
             out,
             "[General]\na = 1\n\n[Providers]\nusenet_retention = 6000\n"
         );
-        assert_eq!(rewrite("", &[edit("S", "k", "v")]), "[S]\nk = v\n");
+        assert_eq!(rw("", &[edit("S", "k", "v")]), "[S]\nk = v\n");
     }
 
     #[test]
     fn comments_and_continuations_are_not_keys() {
         let text = "[General]\n# search_delay = 9\nnotes = a\n  search_delay = 7\n";
-        assert_eq!(get(text, "General", "search_delay"), None);
-        let out = rewrite(text, &[edit("General", "search_delay", "1")]);
+        assert_eq!(get(text, "General", "search_delay").as_deref(), None);
+        let out = rw(text, &[edit("General", "search_delay", "1")]);
         assert_eq!(out, format!("{text}search_delay = 1\n"));
     }
 
     #[test]
     fn get_reads_back_what_rewrite_wrote() {
-        let out = rewrite(
+        let out = rw(
             SAMPLE,
             &[
                 edit("Providers", "usenet_retention", "6000"),
@@ -221,32 +302,32 @@ mod tests {
                 edit("Client", "nzb_downloader", "0"),
             ],
         );
-        assert_eq!(get(&out, "Providers", "usenet_retention"), Some("6000"));
-        assert_eq!(get(&out, "General", "search_delay"), Some("1"));
-        assert_eq!(get(&out, "Client", "nzb_downloader"), Some("0"));
-        assert_eq!(get(&out, "Providers", "extra"), Some("a, b"));
-        assert_eq!(get(&out, "Client", "missing"), None);
+        assert_eq!(
+            get(&out, "Providers", "usenet_retention").as_deref(),
+            Some("6000")
+        );
+        assert_eq!(get(&out, "General", "search_delay").as_deref(), Some("1"));
+        assert_eq!(get(&out, "Client", "nzb_downloader").as_deref(), Some("0"));
+        assert_eq!(get(&out, "Providers", "extra").as_deref(), Some("a, b"));
+        assert_eq!(get(&out, "Client", "missing").as_deref(), None);
     }
 
     #[test]
     fn an_edit_that_changes_nothing_is_byte_identical() {
-        assert_eq!(
-            rewrite(SAMPLE, &[edit("General", "search_delay", "5")]),
-            SAMPLE
-        );
+        assert_eq!(rw(SAMPLE, &[edit("General", "search_delay", "5")]), SAMPLE);
     }
 
     #[test]
     fn keys_match_case_insensitively_and_sections_do_not() {
         let text = "[General]\nsearch_delay = 5\n";
-        assert_eq!(get(text, "General", "SEARCH_DELAY"), Some("5"));
-        assert_eq!(get(text, "general", "search_delay"), None);
+        assert_eq!(get(text, "General", "SEARCH_DELAY").as_deref(), Some("5"));
+        assert_eq!(get(text, "general", "search_delay").as_deref(), None);
         assert_eq!(
-            rewrite(text, &[edit("General", "Search_Delay", "1")]),
+            rw(text, &[edit("General", "Search_Delay", "1")]),
             "[General]\nsearch_delay = 1\n"
         );
         assert_eq!(
-            rewrite(text, &[edit("General", "Dynamic_Update", "0")]),
+            rw(text, &[edit("General", "Dynamic_Update", "0")]),
             "[General]\nsearch_delay = 5\ndynamic_update = 0\n"
         );
     }
@@ -255,20 +336,20 @@ mod tests {
     fn empty_values_as_configparser_writes_them() {
         // configparser writes an empty value as `key = ` with the trailing space.
         let text = "[Client]\nsab_host = \nsab_port =\n";
-        assert_eq!(get(text, "Client", "sab_host"), Some(""));
-        assert_eq!(get(text, "Client", "sab_port"), Some(""));
+        assert_eq!(get(text, "Client", "sab_host").as_deref(), Some(""));
+        assert_eq!(get(text, "Client", "sab_port").as_deref(), Some(""));
         assert_eq!(
-            rewrite(
+            rw(
                 text,
                 &[
                     edit("Client", "sab_host", "h"),
                     edit("Client", "sab_port", "8080")
                 ]
             ),
-            "[Client]\nsab_host = h\nsab_port =8080\n"
+            "[Client]\nsab_host = h\nsab_port = 8080\n"
         );
         assert_eq!(
-            rewrite(
+            rw(
                 "[Client]\nsab_host = h\n",
                 &[edit("Client", "sab_host", "")]
             ),
@@ -280,11 +361,11 @@ mod tests {
     fn the_first_delimiter_splits_and_later_ones_belong_to_the_value() {
         let text = "[General]\nhttp_root = http://h:8090/?a=b\n";
         assert_eq!(
-            get(text, "General", "http_root"),
+            get(text, "General", "http_root").as_deref(),
             Some("http://h:8090/?a=b")
         );
         assert_eq!(
-            rewrite(text, &[edit("General", "http_root", "/m")]),
+            rw(text, &[edit("General", "http_root", "/m")]),
             "[General]\nhttp_root = /m\n"
         );
     }
@@ -293,8 +374,107 @@ mod tests {
     fn replacing_a_multiline_value_drops_its_continuation_lines() {
         let text = "[General]\nnotes = a\n\tb\n  c\nnext = 1\n";
         assert_eq!(
-            rewrite(text, &[edit("General", "notes", "z")]),
+            rw(text, &[edit("General", "notes", "z")]),
             "[General]\nnotes = z\nnext = 1\n"
         );
+    }
+
+    #[test]
+    fn invalid_edits_are_rejected_and_nothing_is_applied() {
+        let bad = [
+            (
+                edit("Gen\neral", "k", "v"),
+                EditError::Section("Gen\neral".into()),
+            ),
+            (edit("Gen]", "k", "v"), EditError::Section("Gen]".into())),
+            (edit("General", "", "v"), EditError::Key("".into())),
+            (edit("General", "a=b", "v"), EditError::Key("a=b".into())),
+            (edit("General", "a:b", "v"), EditError::Key("a:b".into())),
+            (edit("General", "k\r", "v"), EditError::Key("k\r".into())),
+            (
+                edit("General", "k", "a\nb"),
+                EditError::Value("a\nb".into()),
+            ),
+            (edit("General", "k", " v"), EditError::Value(" v".into())),
+            (edit("General", "k", "v\t"), EditError::Value("v\t".into())),
+        ];
+        for (e, err) in bad {
+            let edits = [edit("General", "search_delay", "1"), e];
+            assert_eq!(rewrite(SAMPLE, &edits), Err(err));
+        }
+    }
+
+    #[test]
+    fn percent_is_escaped_on_write_and_unescaped_on_read() {
+        let out = rw(SAMPLE, &[edit("General", "search_delay", "50%")]);
+        assert!(out.contains("search_delay = 50%%\n"));
+        assert_eq!(get(&out, "General", "search_delay").as_deref(), Some("50%"));
+        let out = rw(SAMPLE, &[edit("General", "fmt", "%s%%")]);
+        assert!(out.contains("fmt = %%s%%%%\n"));
+        assert_eq!(get(&out, "General", "fmt").as_deref(), Some("%s%%"));
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_multiline_value_does_not_end_it() {
+        let text = "[General]\nnotes = a\n\n  b\n\nnext = 1\n";
+        assert_eq!(get(text, "General", "notes").as_deref(), Some("a\n\nb"));
+        assert_eq!(
+            rw(text, &[edit("General", "notes", "z")]),
+            "[General]\nnotes = z\n\nnext = 1\n"
+        );
+    }
+
+    #[test]
+    fn a_continuation_is_relative_to_the_key_lines_indent() {
+        let text = "[General]\n  notes = a\n  other = b\n    c\n";
+        assert_eq!(get(text, "General", "notes").as_deref(), Some("a"));
+        assert_eq!(get(text, "General", "other").as_deref(), Some("b\nc"));
+        assert_eq!(
+            rw(text, &[edit("General", "other", "z")]),
+            "[General]\n  notes = a\n  other = z\n"
+        );
+    }
+
+    #[test]
+    fn a_comment_ends_a_multiline_value() {
+        let text = "[General]\nnotes = a\n  # c\n  b = 2\n";
+        assert_eq!(get(text, "General", "notes").as_deref(), Some("a"));
+        assert_eq!(get(text, "General", "b").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn section_names_keep_inner_whitespace() {
+        let text = "[ General ]\nk = 1\n";
+        assert_eq!(get(text, " General ", "k").as_deref(), Some("1"));
+        assert_eq!(get(text, "General", "k"), None);
+        assert_eq!(
+            rw(text, &[edit("General", "k", "2")]),
+            "[ General ]\nk = 1\n\n[General]\nk = 2\n"
+        );
+    }
+
+    #[test]
+    fn a_missing_key_goes_after_the_last_entry_not_trailing_comments() {
+        let text = "[A]\nk = 1\n  more\n\n# about B\n[B]\nj = 2\n";
+        assert_eq!(
+            rw(text, &[edit("A", "n", "3")]),
+            "[A]\nk = 1\n  more\nn = 3\n\n# about B\n[B]\nj = 2\n"
+        );
+        assert_eq!(
+            rw("[A]\n# only a comment\n[B]\n", &[edit("A", "n", "3")]),
+            "[A]\nn = 3\n# only a comment\n[B]\n"
+        );
+    }
+
+    #[test]
+    fn filling_an_empty_value_adds_one_space() {
+        assert_eq!(
+            rw(
+                "[C]\nk =\nj=\n",
+                &[edit("C", "k", "v"), edit("C", "j", "w")]
+            ),
+            "[C]\nk = v\nj=w\n"
+        );
+        assert_eq!(rw("[C]\nk = \n", &[edit("C", "k", "v")]), "[C]\nk = v\n");
     }
 }
