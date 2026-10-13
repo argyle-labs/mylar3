@@ -17,8 +17,7 @@ pub mod status;
 pub mod tools;
 
 use plugin_toolkit::service::{
-    BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
-    WorkloadSpec,
+    BoxFuture, Routes, Runtime, ServiceBackend, ServiceError, ServiceStatus, WorkloadSpec,
 };
 
 /// mylar3 backend. Holds only the provider name; per-instance routes/creds
@@ -44,16 +43,6 @@ impl ServiceBackend for Mylar3Backend {
     /// drives pct/docker itself (that mechanic lives in the deploy-target domain).
     fn runtimes(&self) -> Vec<Runtime> {
         vec![Runtime::Docker, Runtime::Podman, Runtime::Lxc]
-    }
-
-    fn capabilities(&self) -> Vec<ServiceCapability> {
-        vec![
-            ServiceCapability::Deploy,
-            ServiceCapability::Backup,
-            ServiceCapability::Restore,
-            ServiceCapability::Configure,
-            ServiceCapability::Status,
-        ]
     }
 
     fn default_port(&self) -> u16 {
