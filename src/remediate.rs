@@ -446,9 +446,18 @@ pub async fn configure(
         changes.extend(shown);
         posted.extend(values);
     }
+    let unset_passwords = !execute;
+    let mut drift = false;
+    for c in &mut changes {
+        if unset_passwords && c.key.ends_with("_password") {
+            c.target = "will be set".into();
+        } else {
+            drift = true;
+        }
+    }
     let mut report = ConfigureReport {
         name: name.to_string(),
-        in_sync: changes.is_empty() && manual.is_empty(),
+        in_sync: !drift && manual.is_empty(),
         changes,
         manual,
         applied: false,
@@ -1005,6 +1014,22 @@ mod tests {
             .unwrap();
         assert!(r.dry_run && !r.in_sync && !r.applied);
         assert_eq!(writes(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_a_set_password_as_will_be_set_not_drift() {
+        let mut rows = landed(&torrent_base(), &qbit());
+        set(&mut rows, "qbittorrent_password", "STORED");
+        let server = server(&[rows], ok()).await;
+        let mut client = qbit();
+        client.password = Some("dry-run-placeholder".into());
+        let r = configure("m", &mylar(&server), None, Some(&client), false)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = r.changes.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["qbittorrent_password"], "{r:?}");
+        assert_eq!(r.changes[0].target, "will be set");
+        assert!(r.in_sync && r.dry_run);
     }
 
     fn landed(
