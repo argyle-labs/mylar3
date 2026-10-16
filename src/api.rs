@@ -1,11 +1,3 @@
-//! Mylar3 HTTP surface: the `/api?apikey=&cmd=` API plus the web routes that
-//! read (`/getConfig`) and write (`/configUpdate`) configuration.
-//!
-//! Mylar's API has no config read or write command (`cmd_list` in
-//! `mylar/api.py`). `/getConfig` is the web UI's settings table: it dumps every
-//! `config.ini` option as `[key, value]` rows. `/configUpdate` is the settings
-//! form's submit target. Both sit behind the web login when one is configured.
-
 use std::collections::BTreeMap;
 
 use plugin_toolkit::http::{Client as HttpClient, HttpError, ResponseBody};
@@ -20,7 +12,6 @@ pub struct Mylar {
     web_auth: Option<(String, String)>,
 }
 
-/// One series row from `getIndex`.
 #[derive(Debug, Deserialize)]
 #[serde(crate = "plugin_toolkit::serde")]
 pub struct Series {
@@ -28,8 +19,6 @@ pub struct Series {
     pub id: Option<String>,
 }
 
-/// One issue row from `getWanted`. Dates are Mylar's `YYYY-MM-DD` strings;
-/// `0000-00-00` or null when ComicVine has none.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(crate = "plugin_toolkit::serde")]
 pub struct WantedIssue {
@@ -48,14 +37,10 @@ pub struct WantedIssue {
 pub struct Wanted {
     #[serde(default)]
     pub issues: Vec<WantedIssue>,
-    /// Present only when Mylar has annuals enabled.
     #[serde(default)]
     pub annuals: Vec<WantedIssue>,
 }
 
-/// One row of Mylar's `snatched` table (`getHistory`). An issue gains a row per
-/// grab and per post-process, so its latest row is its current state.
-/// `DateAdded` is `YYYY-MM-DD HH:MM:SS` in Mylar's local time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(crate = "plugin_toolkit::serde")]
 pub struct Snatch {
@@ -95,13 +80,10 @@ struct ConfigTable {
     rows: Vec<(String, String)>,
 }
 
-/// `config.ini` options keyed by their lowercase ini name, as Mylar last wrote
-/// them. Secrets are in here too; callers read only the keys they report.
 #[derive(Debug, Default, Clone)]
 pub struct ConfigIni(pub BTreeMap<String, String>);
 
 impl ConfigIni {
-    /// The value, with Mylar's `None`/empty placeholders as `None`.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.0
             .get(key)
@@ -113,7 +95,6 @@ impl ConfigIni {
         self.0.contains_key(key)
     }
 
-    /// `config.getboolean` semantics.
     pub fn flag(&self, key: &str) -> Option<bool> {
         match self.get(key)?.to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Some(true),
@@ -128,7 +109,6 @@ impl ConfigIni {
 }
 
 impl Mylar {
-    /// `web_auth` is the web UI login, sent as HTTP basic auth on `/getConfig`.
     pub fn new(base_url: &str, api_key: &str, web_auth: Option<(String, String)>) -> Self {
         Self {
             http: HttpClient::new(),
@@ -154,8 +134,6 @@ impl Mylar {
         Ok(resp.body)
     }
 
-    /// Commands answer either `{success, data}` or their bare payload; a refusal
-    /// (bad key, API disabled) is always `{success: false, error}`.
     async fn api<T: for<'de> Deserialize<'de>>(
         &self,
         cmd: &str,
@@ -193,10 +171,6 @@ impl Mylar {
         self.api("getHistory", &[]).await
     }
 
-    /// Queue post-processing of `folder` (a path inside Mylar's container).
-    /// `nzb_name=Manual Run` makes Mylar scan the whole folder against its
-    /// watchlist; a real job name is joined onto the folder and misses.
-    /// Mylar answers with a plain-text acknowledgement, never JSON.
     pub async fn force_process(&self, folder: &str) -> Result<String> {
         let body = self
             .api_raw(
@@ -228,11 +202,6 @@ impl Mylar {
         Ok(text)
     }
 
-    /// Read `config.ini` through the web UI's settings table. Errors name the
-    /// cause: a 401 is a missing/wrong basic login; an HTML reply is the
-    /// forms-login redirect, which needs a session cookie set during a
-    /// redirect, and the toolkit HTTP client follows redirects without
-    /// exposing intermediate `Set-Cookie` headers.
     pub async fn config(&self) -> Result<ConfigIni> {
         let resp = self
             .http
@@ -271,9 +240,6 @@ impl Mylar {
         }
     }
 
-    /// Submit the web settings form (`/configUpdate`). A save answers 200 with
-    /// an empty body; anything else (an error page, the forms-login page) is a
-    /// failure. Callers confirm what landed by re-reading [`Self::config`].
     pub async fn config_update(&self, fields: Vec<(String, String)>) -> Result<()> {
         let resp = self
             .http
@@ -295,8 +261,6 @@ impl Mylar {
         }
     }
 
-    /// Transport errors carry the request URL, which holds the API key in its
-    /// query and the web login in its userinfo.
     fn transport(&self, what: &str, e: HttpError) -> plugin_toolkit::anyhow::Error {
         anyhow!("{what}: {}", self.redact(&e.to_string()))
     }
@@ -328,7 +292,6 @@ impl Mylar {
     }
 }
 
-/// reqwest turns URL userinfo into an `Authorization: Basic` header.
 fn with_userinfo(base: &str, user: &str, pass: &str) -> String {
     let creds = format!(
         "{}:{}@",
@@ -341,8 +304,6 @@ fn with_userinfo(base: &str, user: &str, pass: &str) -> String {
     }
 }
 
-/// Blank every `marker` query value, for keys rendered in forms the literal
-/// replacement in [`Mylar::redact`] misses.
 fn redact_query(msg: &str, marker: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
@@ -429,7 +390,6 @@ mod tests {
     #[tokio::test]
     async fn config_reads_settings_table_with_basic_auth() {
         let server = MockServer::start().await;
-        // base64("admin:p@ss")
         Mock::given(method("GET"))
             .and(path("/getConfig"))
             .and(header("authorization", "Basic YWRtaW46cEBzcw=="))
@@ -492,7 +452,6 @@ mod tests {
 
     #[tokio::test]
     async fn transport_errors_hide_the_api_key_and_web_login() {
-        // Nothing listens on port 1, so reqwest fails with the URL in its error.
         let m = Mylar::new(
             "http://127.0.0.1:1",
             "SECRETKEY123",

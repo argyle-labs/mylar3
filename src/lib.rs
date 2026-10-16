@@ -1,9 +1,3 @@
-//! mylar3 service backend — Mylar3 comic book (CBR/CBZ) library manager.
-//!
-//! Implements `ServiceBackend` so the generic `service.*` tools
-//! (deploy/backup/restore/configure/status/connect/sync) drive mylar3,
-//! alongside the `mylar3.` detect + remediate tools in [`tools`]. The only orca
-//! dep is `plugin-toolkit`. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
 
 pub mod acquisition;
@@ -21,8 +15,6 @@ use plugin_toolkit::service::{
     WorkloadSpec,
 };
 
-/// mylar3 backend. Holds only the provider name; per-instance routes/creds
-/// come from the `Routes` the generic `service.*` tools hand each op.
 #[derive(Debug, Clone)]
 pub struct Mylar3Backend {
     provider: &'static str,
@@ -39,9 +31,6 @@ impl ServiceBackend for Mylar3Backend {
         self.provider
     }
 
-    /// Runtimes mylar3 can be placed on. `service.deploy` hands the
-    /// `workload_spec` below to a matching deploy target — this backend never
-    /// drives pct/docker itself (that mechanic lives in the deploy-target domain).
     fn runtimes(&self) -> Vec<Runtime> {
         vec![Runtime::Docker, Runtime::Podman, Runtime::Lxc]
     }
@@ -60,10 +49,6 @@ impl ServiceBackend for Mylar3Backend {
         8090
     }
 
-    /// In-workload paths holding config/data. This is ALL mylar3 declares for
-    /// backup — the generic pluggable backup (tar for containers/LXC, PBS for
-    /// Proxmox guests when available) snapshots these. No backup/restore code
-    /// here; those are inherited from ServiceBackend's defaults.
     fn data_paths(&self) -> Vec<String> {
         vec!["/config".to_string()]
     }
@@ -74,14 +59,9 @@ impl ServiceBackend for Mylar3Backend {
         _instance: &'a str,
         _routes: &'a Routes,
     ) -> BoxFuture<'a, Result<WorkloadSpec, ServiceError>> {
-        // TODO: describe the mylar3 workload (image/template, ports, mounts,
-        // env) for the chosen runtime. The deploy target turns this into a
-        // compose service / LXC config / VM. See deploy-target::WorkloadSpec.
         Box::pin(async move { Err(ServiceError::unimplemented("mylar3.workload_spec")) })
     }
 
-    /// Settings changes go through `mylar3.configure`, which is admin-only and
-    /// dry-run by default; this opaque-string entry point has neither.
     fn configure<'a>(
         &'a self,
         _instance: &'a str,
@@ -96,8 +76,6 @@ impl ServiceBackend for Mylar3Backend {
         })
     }
 
-    /// The `mylar3.status` report for the endpoint named `instance`, reduced to
-    /// health plus its findings; `ServiceInfo` has no mylar3 variant.
     fn status<'a>(
         &'a self,
         instance: &'a str,

@@ -1,8 +1,3 @@
-//! A download client orca resolved (orca#796) mapped to the `config.ini` values
-//! Mylar v0.11.0 reads. A direct ini write skips Mylar's save-time fixups, so
-//! each value is the one Mylar itself would leave after a save. Indexers reach
-//! Mylar through Prowlarr, not here.
-
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::reqwest::Url;
 use plugin_toolkit::scrub;
@@ -11,7 +6,6 @@ use crate::api::ConfigIni;
 use crate::remediate::SettingChange;
 use crate::{ini, secret};
 
-/// The client category mylar3 files its downloads under, per media type.
 pub fn category_map(media_type: &str) -> Option<&'static str> {
     (media_type == "comics").then_some("comics")
 }
@@ -45,7 +39,6 @@ impl ClientProvider {
         }
     }
 
-    /// The `config.ini` section holding this client's settings.
     fn section(self) -> &'static str {
         match self {
             ClientProvider::Sabnzbd => "SABnzbd",
@@ -60,7 +53,6 @@ impl ClientProvider {
         }
     }
 
-    /// The `[Client]` key and value selecting this client.
     fn selector(self) -> (&'static str, &'static str) {
         match self {
             ClientProvider::Sabnzbd => ("nzb_downloader", "0"),
@@ -76,27 +68,16 @@ impl ClientProvider {
     }
 }
 
-/// A download client as core hands it over: every reference resolved, secrets
-/// in plain text. Blank fields count as absent, except a secret: an empty one
-/// or one with leading or trailing whitespace is refused.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct ResolvedDownloadClient {
     pub provider: Option<ClientProvider>,
     pub name: String,
-    /// Base URL, e.g. `http://10.0.0.15:8080`.
     pub url: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub api_key: Option<String>,
-    /// Client category or label; defaults to [`category_map`]`("comics")`.
     pub category: Option<String>,
-    /// A folder as Mylar's container sees it: where SABnzbd/NZBGet complete
-    /// into (`sab_directory`, `nzbget_directory`), or the blackhole/watch
-    /// folder (`blackhole_dir`, `local_watchdir`).
     pub directory: Option<String>,
-    /// The folder a torrent client saves into, as the client sees it:
-    /// `qbittorrent_folder`, `deluge_download_directory`,
-    /// `transmission_directory`, `rtorrent_directory`.
     pub client_directory: Option<String>,
     pub priority: Option<String>,
 }
@@ -127,8 +108,6 @@ impl std::fmt::Debug for ResolvedDownloadClient {
     }
 }
 
-/// Client keys Mylar stores encrypted when `encrypt_passwords` is on
-/// (`encrypt_items` in `mylar/config.py`).
 const ENCRYPTED: &[&str] = &[
     "sab_password",
     "sab_apikey",
@@ -144,17 +123,12 @@ pub fn is_secret(key: &str) -> bool {
     ENCRYPTED.contains(&key) || scrub::is_sensitive_key(key)
 }
 
-/// What configparser writes for a `str` setting whose default is `None`, and
-/// what Mylar reads back as unset.
 const UNSET: &str = "None";
 
-/// Whether Mylar reads `v` as unset.
 fn is_unset(v: &str) -> bool {
     matches!(v.trim(), "" | UNSET)
 }
 
-/// `value` for output: withheld for a secret key unless it is unset, and for an
-/// `nzbget_sub` that may hold NZBGet's `user:pass` segment.
 fn shown<'a>(key: &str, value: &'a str) -> &'a str {
     if (is_secret(key) && !is_unset(value)) || (key == "nzbget_sub" && path_holds_colon(value)) {
         scrub::REDACTED
@@ -163,7 +137,6 @@ fn shown<'a>(key: &str, value: &'a str) -> &'a str {
     }
 }
 
-/// One `config.ini` value, as configparser reads it back.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Setting {
     pub section: &'static str,
@@ -191,17 +164,12 @@ impl std::fmt::Debug for Setting {
     }
 }
 
-/// Every setting a client owns, absent fields written as unset, plus the
-/// supplied fields mylar3 has no setting for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mapping {
     pub settings: Vec<Setting>,
     pub ignored: Vec<String>,
 }
 
-/// Control characters break the ini line, and the URL parser drops some
-/// silently, so the value checked would not be the value stored. Errors never
-/// echo the value.
 fn refuse_control(name: &str, v: &str) -> Result<()> {
     if v.chars().any(char::is_control) {
         bail!("{name} must not contain control characters");
@@ -216,7 +184,6 @@ fn refuse_unset(name: &str, v: &str) -> Result<()> {
     Ok(())
 }
 
-/// A supplied field, trimmed; `None` when absent or blank.
 fn present<'a>(name: &str, v: &'a Option<String>) -> Result<Option<&'a str>> {
     if let Some(v) = v.as_deref() {
         refuse_control(name, v)?;
@@ -228,8 +195,6 @@ fn present<'a>(name: &str, v: &'a Option<String>) -> Result<Option<&'a str>> {
     Ok(Some(v))
 }
 
-/// A supplied secret, untrimmed: an empty one would clear the stored secret
-/// and edge whitespace is most likely a paste error.
 fn present_secret<'a>(name: &str, v: &'a Option<String>) -> Result<Option<&'a str>> {
     let Some(v) = v.as_deref() else {
         return Ok(None);
@@ -245,8 +210,6 @@ fn present_secret<'a>(name: &str, v: &'a Option<String>) -> Result<Option<&'a st
     Ok(Some(v))
 }
 
-/// The words Mylar's senders map (`search.py`, `nzbget.py`); any other value
-/// sends no priority or fails the send.
 const SAB_PRIORITIES: &[&str] = &["Default", "Low", "Normal", "High", "Paused"];
 const NZBGET_PRIORITIES: &[&str] = &[
     "Default",
@@ -258,9 +221,6 @@ const NZBGET_PRIORITIES: &[&str] = &[
     "Paused",
 ];
 
-/// The priority word to store. Matching ignores case; for SABnzbd a digit is
-/// taken as `configure` reads one, 0-4 in [`SAB_PRIORITIES`] order, since it
-/// only becomes a word in Mylar's memory.
 fn priority(
     value: Option<&str>,
     words: &[&'static str],
@@ -279,8 +239,6 @@ fn priority(
     }
 }
 
-/// Credentials belong in the username/password settings; in the url they
-/// would be stored under a key no redaction covers.
 fn refuse_userinfo(url: &str) -> Result<()> {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
@@ -290,15 +248,12 @@ fn refuse_userinfo(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// The path of `url`, scheme optional, without its query or fragment.
 fn raw_path(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let rest = rest.split(['?', '#']).next().unwrap_or_default();
     rest.find('/').map_or("", |i| &rest[i..])
 }
 
-/// NZBGet takes credentials as a `/user:pass/` path segment, so a `:` in a
-/// path is treated as one.
 fn path_holds_colon(path: &str) -> bool {
     path.contains(':') || path.to_ascii_lowercase().contains("%3a")
 }
@@ -318,8 +273,6 @@ fn http_url(url: &str) -> Result<Url> {
     Ok(u)
 }
 
-/// `sab_host` as Mylar's `configure` leaves it: `http://` added to a bare
-/// `host:port`, no trailing `/`. Mylar appends `/api?...`, so no query.
 fn sab_host(url: &str) -> Result<String> {
     let full = if url.contains("://") {
         url.to_string()
@@ -333,8 +286,6 @@ fn sab_host(url: &str) -> Result<String> {
     Ok(u.as_str().trim_end_matches('/').to_string())
 }
 
-/// `(nzbget_host, nzbget_port, nzbget_sub)`: Mylar builds NZBGet's URL as
-/// `host:port` + the sub path + `/xmlrpc`.
 fn nzbget_url(url: &str) -> Result<(String, String, Option<String>)> {
     let u = http_url(url)?;
     if u.query().is_some() || u.fragment().is_some() {
@@ -354,9 +305,6 @@ fn nzbget_url(url: &str) -> Result<(String, String, Option<String>)> {
     ))
 }
 
-/// `nzbget_sub` as `nzbget.py` uses it, one leading `/` and no trailing one,
-/// so `nzbget` and `/nzbget/` store alike. A final `xmlrpc` segment is dropped:
-/// Mylar appends its own.
 fn nzbget_sub(path: &str) -> Option<String> {
     let p = path.trim_matches('/');
     sub_form(match p.rsplit_once('/') {
@@ -371,8 +319,6 @@ fn sub_form(path: &str) -> Option<String> {
     (!p.is_empty()).then(|| format!("/{p}"))
 }
 
-/// transmissionrpc uses a URL with a scheme verbatim, adding
-/// `/transmission/rpc` only to a bare `host:port`.
 fn transmission_url(url: &str) -> Result<String> {
     let u = http_url(url)?;
     if u.query().is_some() || u.fragment().is_some() {
@@ -385,9 +331,6 @@ fn transmission_url(url: &str) -> Result<String> {
     })
 }
 
-/// `(rtorrent_host, rtorrent_rpc_url)`: Mylar cleans the host to
-/// `scheme://host:port/` and appends the rpc url. It prefixes `http://` to any
-/// host not starting `https:`/`http://`, so other schemes cannot be stored.
 fn rtorrent_url(url: &str) -> Result<(String, Option<String>)> {
     if !url.contains("://") {
         bail!("rTorrent url needs an http:// or https:// scheme");
@@ -405,10 +348,6 @@ fn rtorrent_url(url: &str) -> Result<(String, Option<String>)> {
     Ok((base, (!rpc.is_empty()).then(|| rpc.to_string())))
 }
 
-/// `utorrent_host` with its path kept as given: utorrent.py strips one `/`
-/// and one `/gui` before appending `/gui/`, so rewriting the path could change
-/// the URL Mylar builds. It prefixes `http://` only to a host not starting
-/// `http`, so a bare host gets it here: `httpbox` would otherwise go unprefixed.
 fn utorrent_host(url: &str) -> Result<String> {
     let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
     let u = http_url(&format!("{scheme}://{rest}"))?;
@@ -418,8 +357,6 @@ fn utorrent_host(url: &str) -> Result<String> {
     Ok(format!("{}://{rest}", u.scheme()))
 }
 
-/// Deluge's `host:port`: Mylar splits the setting on `:`, so no scheme and no
-/// IPv6 literal.
 fn deluge_host(url: &str) -> Result<String> {
     let with_scheme = if url.contains("://") {
         url.to_string()
@@ -434,7 +371,6 @@ fn deluge_host(url: &str) -> Result<String> {
     if !matches!(u.path(), "" | "/") || u.query().is_some() || u.fragment().is_some() {
         bail!("Deluge url must be host:port, without a path, query or fragment");
     }
-    // `Url` drops a scheme's default port, so read it from the text.
     let authority = with_scheme
         .split_once("://")
         .map_or("", |(_, rest)| rest)
@@ -450,8 +386,6 @@ fn deluge_host(url: &str) -> Result<String> {
     Ok(format!("{host}:{port}"))
 }
 
-/// Mylar decrypts when `ENCRYPT_PASSWORDS is True`, which config load sets
-/// with configparser's `getboolean`.
 fn encrypts(ini: &ConfigIni) -> bool {
     ini.flag("encrypt_passwords") == Some(true)
 }
@@ -460,7 +394,6 @@ fn encrypt(key: &str, value: &str) -> Result<String> {
     secret::encode(value).map_err(|e| anyhow!("encrypting {key}: {e}"))
 }
 
-/// The settings `client` maps to. `ini` says whether Mylar encrypts secrets.
 pub fn map(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<Mapping> {
     use ClientProvider::*;
     let provider = client
@@ -539,7 +472,6 @@ pub fn map(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<Mapping> 
         }
         Deluge => {
             let host = deluge_host(need_url()?)?;
-            // deluge.py refuses to connect without both.
             if username.is_none() || password.is_none() {
                 bail!("Deluge needs a username and password");
             }
@@ -547,7 +479,6 @@ pub fn map(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<Mapping> 
             put("deluge_username", username, "username");
             put("deluge_password", password, "password");
             put("deluge_label", category, "category");
-            // Its default is "", not None.
             put(
                 "deluge_download_directory",
                 Some(client_directory.unwrap_or("")),
@@ -626,13 +557,10 @@ pub fn map(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<Mapping> 
     Ok(Mapping { settings, ignored })
 }
 
-/// A mapped setting whose stored value Mylar reads differently.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Change {
     pub setting: Setting,
-    /// The value `config.ini` holds now; `None` when the key is absent.
     pub current: Option<String>,
-    /// The change unsets a value Mylar reads as set now.
     pub clears: bool,
 }
 
@@ -649,12 +577,10 @@ impl std::fmt::Debug for Change {
     }
 }
 
-/// [`plan`]'s result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientDiff {
     pub name: String,
     pub changes: Vec<Change>,
-    /// Fields the client supplied that mylar3 has no setting for.
     pub ignored: Vec<String>,
 }
 
@@ -701,8 +627,6 @@ impl ClientDiff {
     }
 }
 
-/// Mylar's default for an owned key whose `_CONFIG_DEFINITIONS` default is not
-/// `None`; a missing or unset key reads as it (`minimal_ini` omits defaults).
 fn default(key: &str) -> Option<&'static str> {
     match key {
         "sab_priority" => Some("Default"),
@@ -713,7 +637,6 @@ fn default(key: &str) -> Option<&'static str> {
     }
 }
 
-/// `sab_host` as Mylar's config load fixes it up, character for character.
 fn sab_host_read(v: &str) -> String {
     let mut v = if v.starts_with("http://") || v.starts_with("https://") {
         v.to_string()
@@ -726,8 +649,6 @@ fn sab_host_read(v: &str) -> String {
     v
 }
 
-/// `sab_priority` as Mylar's config load reads it: a digit string becomes a
-/// word, any other value is compared exactly, as the senders do.
 fn sab_priority_read(v: &str) -> String {
     if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
         return v.to_string();
@@ -742,7 +663,6 @@ fn sab_priority_read(v: &str) -> String {
     word.to_string()
 }
 
-/// `utorrent_host` as utorrent.py builds its base URL from it.
 fn utorrent_host_read(v: &str) -> String {
     let v = if v.starts_with("http") {
         v.to_string()
@@ -753,9 +673,6 @@ fn utorrent_host_read(v: &str) -> String {
     v.strip_suffix("/gui").unwrap_or(v).to_string()
 }
 
-/// `v` as Mylar acts on it, `None` when unset: a missing or unset key as its
-/// default, secrets decrypted only when Mylar decrypts them, and the forms
-/// Mylar's readers treat alike made equal.
 fn canonical(key: &str, v: Option<&str>, encrypted: bool) -> Option<String> {
     let v = match v.map(str::trim).filter(|v| !is_unset(v)) {
         Some(v) => v,
@@ -785,14 +702,10 @@ fn canonical(key: &str, v: Option<&str>, encrypted: bool) -> Option<String> {
     }
 }
 
-/// The settings `client` changes, against `ini`'s configparser-read values:
-/// `%` unescaped, as `/getConfig` serves them and [`ini::get`] returns them.
 pub fn plan(ini: &ConfigIni, client: &ResolvedDownloadClient) -> Result<ClientDiff> {
     let mapping = map(ini, client)?;
     let encrypted = encrypts(ini);
     let stored = |key| canonical(key, ini.0.get(key).map(String::as_str), encrypted);
-    // In Docker, Mylar fills an unset SAB directory with these in memory
-    // (config.py, DOCKER-AWARE) and a web save persists them.
     let docker_sab = mapping
         .settings
         .iter()

@@ -1,19 +1,13 @@
-//! Values Mylar stores with `encrypt_passwords` on (`mylar/encrypted.py`):
-//! `^~$z$` + standard padded base64 of the UTF-8 secret followed by 8 random
-//! salt bytes. It is an obfuscation, not encryption: decoding needs no key.
-
 const PREFIX: &str = "^~$z$";
 const SALT_LEN: usize = 8;
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// `secret` in Mylar's stored form, with a fresh salt.
 pub fn encode(secret: &str) -> Result<String, getrandom::Error> {
     let mut salt = [0u8; SALT_LEN];
     getrandom::fill(&mut salt)?;
     Ok(encode_with_salt(secret, salt))
 }
 
-/// The plaintext of a stored value; `None` if it is not in Mylar's form.
 pub fn decode(stored: &str) -> Option<String> {
     let mut bytes = base64_decode(stored.strip_prefix(PREFIX)?)?;
     let len = bytes.len().checked_sub(SALT_LEN)?;
@@ -45,9 +39,6 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Strict: Python's `b64decode` rejects bad padding but skips stray characters
-/// and ignores nonzero trailing bits; rejecting those too only matters for
-/// values Mylar never writes.
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(4) {
         return None;
@@ -94,7 +85,6 @@ mod tests {
 
     #[test]
     fn decodes_a_vector_built_by_upstream_algorithm() {
-        // Python: base64.b64encode('hunter2é'.encode('utf-8') + bytes(range(1, 9)))
         let stored = "^~$z$aHVudGVyMsOpAQIDBAUGBwg=";
         assert_eq!(decode(stored).as_deref(), Some("hunter2é"));
         assert_eq!(
@@ -105,7 +95,6 @@ mod tests {
 
     #[test]
     fn decodes_a_vector_with_high_salt_bytes() {
-        // Python: base64.b64encode(b'hunter2' + bytes([0x80, 0xff, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0]))
         let stored = "^~$z$aHVudGVyMoD/kKCwwNDg";
         let salt = [0x80, 0xff, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0];
         assert_eq!(decode(stored).as_deref(), Some("hunter2"));
@@ -122,9 +111,15 @@ mod tests {
     fn bad_base64_is_none() {
         assert_eq!(decode("^~$z$not base64!"), None);
         assert_eq!(decode("^~$z$aHVudGVyMsOpAQIDBAUGBwg"), None);
-        // Valid base64 shorter than the salt.
+    }
+
+    #[test]
+    fn valid_base64_shorter_than_the_salt_is_none() {
         assert_eq!(decode("^~$z$AAAA"), None);
-        // Non-canonical: the final `h` carries nonzero bits past the last byte.
+    }
+
+    #[test]
+    fn non_canonical_trailing_bits_are_none() {
         assert_eq!(decode("^~$z$aHVudGVyMsOpAQIDBAUGBwh="), None);
     }
 }

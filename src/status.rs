@@ -1,9 +1,3 @@
-//! `mylar3.status`: search reach, completed-download handling, stuck grabs, and
-//! torrent wiring, read from Mylar's API and its settings table.
-//!
-//! Every config-derived field is `None` when the setting could not be read;
-//! `unknown` names those settings and `config_error` says why.
-
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -12,7 +6,6 @@ use plugin_toolkit::time::Timestamp;
 
 use crate::api::{ConfigIni, Mylar, Snatch, Wanted, WantedIssue};
 
-/// `config.ini` keys the report reads.
 const KEYS: &[&str] = &[
     "usenet_retention",
     "search_delay",
@@ -33,7 +26,6 @@ const KEYS: &[&str] = &[
     "torrent_downloader",
 ];
 
-/// Sample size for the stuck-grab list.
 const STUCK_SAMPLE: usize = 10;
 
 #[orca_struct]
@@ -108,8 +100,7 @@ pub struct TorrentCheck {
     pub torrents_enabled: Option<bool>,
     pub torrent_search_enabled: Option<bool>,
     pub torznab_enabled: Option<bool>,
-    /// `watchfolder`, `utorrent`, `rtorrent`, `transmission`, `deluge`,
-    /// `qbittorrent`, or Mylar's raw value.
+    /// Configured torrent client name, or Mylar's raw value.
     pub downloader: Option<String>,
     /// The selected downloader has its host (or watch dir) set.
     pub client_configured: Option<bool>,
@@ -130,8 +121,7 @@ pub struct StatusReport {
     pub torrents: TorrentCheck,
     /// Why the settings table could not be read.
     pub config_error: Option<String>,
-    /// Settings that could not be read (absent from `config.ini` or table
-    /// unreadable).
+    /// Settings that could not be read (absent from `config.ini` or table unreadable).
     pub unknown: Vec<String>,
     /// Detected drift, one line each.
     pub findings: Vec<String>,
@@ -235,8 +225,6 @@ pub fn build(
     }
 }
 
-/// Release date when known, else cover date; `YYYY-MM-DD`, or `None` for
-/// Mylar's `0000-00-00` placeholder.
 fn issue_date(i: &WantedIssue) -> Option<String> {
     [&i.release_date, &i.issue_date]
         .into_iter()
@@ -254,11 +242,9 @@ fn retention(ini: &ConfigIni, issues: &[&WantedIssue], now: Timestamp) -> Retent
     let days = ini.int("usenet_retention");
     let dates: Vec<String> = issues.iter().filter_map(|i| issue_date(i)).collect();
     let oldest_wanted_date = dates.iter().min().cloned();
-    // Mylar appends maxage only for a set retention; 0 is still sent.
     let cutoff_date = days
         .filter(|d| *d >= 0)
         .map(|d| now.minus(Duration::from_secs(d as u64 * 86_400)).date());
-    // `YYYY-MM-DD` sorts as text.
     let wanted_before_cutoff = cutoff_date
         .as_ref()
         .map(|c| dates.iter().filter(|d| d.as_str() < c.as_str()).count());
@@ -301,7 +287,6 @@ fn post_processing(ini: &ConfigIni) -> PostProcessingCheck {
 
 fn post_processing_findings(ini: &ConfigIni, pp: &PostProcessingCheck) -> Vec<String> {
     let mut out = Vec::new();
-    // search.py gates every NZB search on a usable downloader.
     if ini.flag("newznab") == Some(true) && pp.nzb_downloader.as_deref() == Some("none") {
         out.push(
             "newznab indexers are on but nzb_downloader=3 (none): Mylar aborts every search \
@@ -348,8 +333,7 @@ fn post_processing_findings(ini: &ConfigIni, pp: &PostProcessingCheck) -> Vec<St
     out
 }
 
-/// `YYYY-MM-DD HH:MM:SS`, the shape of Mylar's `DateAdded`.
-fn mylar_datetime(t: Timestamp) -> String {
+fn utc_as_mylar_local_time(t: Timestamp) -> String {
     t.to_rfc3339()
         .replacen('T', " ", 1)
         .trim_end_matches('Z')
@@ -357,9 +341,8 @@ fn mylar_datetime(t: Timestamp) -> String {
 }
 
 pub fn stuck(history: &[Snatch], threshold_hours: u32, now: Timestamp) -> StuckSnatched {
-    // Mylar stamps local time; against UTC the threshold is off by the host's
-    // UTC offset, which is noise at the hours-to-days scale this is read at.
-    let before = mylar_datetime(now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)));
+    let before =
+        utc_as_mylar_local_time(now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)));
     let mut latest: BTreeMap<&str, &Snatch> = BTreeMap::new();
     let mut grabs: BTreeMap<&str, usize> = BTreeMap::new();
     for s in history {
@@ -423,8 +406,6 @@ fn torrent_downloader_name(v: i64) -> String {
     }
 }
 
-/// Whether the selected torrent client has the setting its `connect` needs; a
-/// missing host leaves Mylar's client object without `.client`.
 fn client_configured(ini: &ConfigIni, downloader: i64) -> Option<bool> {
     let host = |k: &str| ini.has(k).then(|| ini.get(k).is_some());
     match downloader {
@@ -535,7 +516,6 @@ mod tests {
             24,
             now(),
         );
-        // 2026-10-05 minus 3500 days.
         assert_eq!(s.retention.cutoff_date.as_deref(), Some("2017-03-06"));
         assert_eq!(
             s.retention.oldest_wanted_date.as_deref(),
