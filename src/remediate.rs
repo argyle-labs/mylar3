@@ -5,9 +5,10 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::scrub;
 use plugin_toolkit::time::Timestamp;
 
+use crate::acquisition::{self, Protocol, ResolvedDownloadClient};
 use crate::api::{ConfigIni, Mylar};
 use crate::definitions::CONFIG_KEYS;
-use crate::status;
+use crate::{secret, status};
 
 /// `checked_configs` in Mylar's `configUpdate` (`mylar/webserve.py`): the form's
 /// checkboxes, which it sets False whenever they are not posted.
@@ -226,6 +227,47 @@ pub fn plan(ini: &ConfigIni, usenet_retention: Option<u32>) -> (Vec<SettingChang
     (changes, manual)
 }
 
+/// Changes selecting and configuring `client` as Mylar's torrent downloader:
+/// the reported form with secrets withheld, and the plaintext form to post,
+/// which Mylar encrypts on save.
+pub fn plan_torrent(
+    ini: &ConfigIni,
+    client: &ResolvedDownloadClient,
+) -> Result<(Vec<SettingChange>, Vec<SettingChange>)> {
+    if client.provider.map(|p| p.protocol()) != Some(Protocol::Torrent) {
+        bail!("torrent client '{}' is not a torrent provider", client.name);
+    }
+    let diff = acquisition::plan(ini, client)?;
+    if !diff.ignored.is_empty() {
+        bail!(
+            "torrent client '{}' has no Mylar setting for [{}]",
+            client.name,
+            diff.ignored.join(", ")
+        );
+    }
+    let report = diff.report();
+    let shown = report.changes.into_iter().chain(report.clears).collect();
+    let posted = diff
+        .changes
+        .iter()
+        .map(|c| {
+            let v = &c.setting.value;
+            let target = if c.clears {
+                String::new()
+            } else {
+                secret::decode(v).unwrap_or_else(|| v.clone())
+            };
+            SettingChange {
+                key: c.setting.key.to_string(),
+                current: None,
+                target,
+                reason: String::new(),
+            }
+        })
+        .collect();
+    Ok((shown, posted))
+}
+
 /// The `/configUpdate` body that applies `changes`. Mylar sets every
 /// [`FORM_CHECKBOXES`] key not posted to False and replaces both provider lists
 /// with the rows posted, while other keys keep their value unless posted. So
@@ -385,6 +427,7 @@ pub async fn configure(
     name: &str,
     m: &Mylar,
     usenet_retention: Option<u32>,
+    torrent: Option<&ResolvedDownloadClient>,
     execute: bool,
 ) -> Result<ConfigureReport> {
     if usenet_retention == Some(0) {
@@ -394,7 +437,13 @@ pub async fn configure(
         .config()
         .await
         .context("read Mylar's settings to plan configure")?;
-    let (changes, manual) = plan(&before, usenet_retention);
+    let (mut changes, manual) = plan(&before, usenet_retention);
+    let mut posted = changes.clone();
+    if let Some(client) = torrent {
+        let (shown, values) = plan_torrent(&before, client)?;
+        changes.extend(shown);
+        posted.extend(values);
+    }
     let mut report = ConfigureReport {
         name: name.to_string(),
         in_sync: changes.is_empty() && manual.is_empty(),
@@ -407,7 +456,7 @@ pub async fn configure(
     if !execute || report.changes.is_empty() {
         return Ok(report);
     }
-    let fields = form(&before, &report.changes)?;
+    let fields = form(&before, &posted)?;
     let fresh = m
         .config()
         .await
@@ -436,8 +485,11 @@ pub async fn configure(
         .config()
         .await
         .context("settings were submitted; re-read to verify failed")?;
-    let missed: Vec<&str> = plan(&after, usenet_retention)
-        .0
+    let mut drift = plan(&after, usenet_retention).0;
+    if let Some(client) = torrent {
+        drift.extend(plan_torrent(&after, client)?.0);
+    }
+    let missed: Vec<&str> = drift
         .iter()
         .filter_map(|c| report.changes.iter().find(|p| p.key == c.key))
         .map(|c| c.key.as_str())
@@ -755,7 +807,9 @@ mod tests {
     #[tokio::test]
     async fn dry_run_plans_retention_and_writes_nothing() {
         let server = server(&[table(&[])], ok()).await;
-        let r = configure("m", &mylar(&server), None, false).await.unwrap();
+        let r = configure("m", &mylar(&server), None, None, false)
+            .await
+            .unwrap();
         assert!(r.dry_run && !r.applied && !r.in_sync);
         assert_eq!(r.changes.len(), 1);
         assert_eq!(r.changes[0].key, "usenet_retention");
@@ -773,7 +827,9 @@ mod tests {
             ("usenet_retention", "6000"),
         ]);
         let server = server(&[before.clone(), before.clone(), after], ok()).await;
-        let r = configure("m", &mylar(&server), None, true).await.unwrap();
+        let r = configure("m", &mylar(&server), None, None, true)
+            .await
+            .unwrap();
         assert!(r.applied && r.verified && !r.dry_run, "{r:?}");
 
         let form = posted_form(&server).await;
@@ -801,7 +857,9 @@ mod tests {
     #[tokio::test]
     async fn execute_in_sync_writes_nothing() {
         let server = server(&[table(&[("usenet_retention", "6000")])], ok()).await;
-        let r = configure("m", &mylar(&server), None, true).await.unwrap();
+        let r = configure("m", &mylar(&server), None, None, true)
+            .await
+            .unwrap();
         assert!(r.in_sync && !r.dry_run && !r.applied);
         assert_eq!(writes(&server).await, 0);
     }
@@ -816,7 +874,7 @@ mod tests {
             ("gotify_token", "GLEAK"),
         ]);
         let server = server(&[before.clone(), before, after], ok()).await;
-        let err = configure("m", &mylar(&server), None, true)
+        let err = configure("m", &mylar(&server), None, None, true)
             .await
             .unwrap_err()
             .to_string();
@@ -835,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn execute_errors_when_the_change_does_not_land() {
         let server = server(&[table(&[])], ok()).await;
-        let err = configure("m", &mylar(&server), None, true)
+        let err = configure("m", &mylar(&server), None, None, true)
             .await
             .unwrap_err()
             .to_string();
@@ -851,7 +909,7 @@ mod tests {
         let before = table(&[]);
         let moved = table(&[("post_processing", "False")]);
         let server = server(&[before, moved], ok()).await;
-        let err = configure("m", &mylar(&server), None, true)
+        let err = configure("m", &mylar(&server), None, None, true)
             .await
             .unwrap_err()
             .to_string();
@@ -869,12 +927,91 @@ mod tests {
             ResponseTemplate::new(200).set_body_string("<html>Traceback</html>"),
         )
         .await;
-        let err = configure("m", &mylar(&server), None, true)
+        let err = configure("m", &mylar(&server), None, None, true)
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("unexpected reply"), "{err}");
         assert!(err.contains("enable_rss: False -> True"), "{err}");
+    }
+
+    fn qbit() -> ResolvedDownloadClient {
+        ResolvedDownloadClient {
+            provider: Some(acquisition::ClientProvider::Qbittorrent),
+            name: "qbittorrent".into(),
+            url: Some("http://10.0.0.16:8080".into()),
+            username: Some("admin".into()),
+            password: Some("QBPASS".into()),
+            category: Some("comics".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_switches_torrent_client_posting_plaintext_and_reporting_redacted() {
+        let base = [
+            ("usenet_retention", "6000"),
+            ("encrypt_passwords", "True"),
+            ("enable_torrents", "True"),
+            ("torrent_downloader", "4"),
+        ];
+        let before = table(&base);
+        let mut after = table(&base);
+        for (k, v) in [
+            ("torrent_downloader", "5"),
+            ("qbittorrent_host", "http://10.0.0.16:8080"),
+            ("qbittorrent_username", "admin"),
+            ("qbittorrent_label", "comics"),
+        ] {
+            set(&mut after, k, v);
+        }
+        let stored = secret::encode("QBPASS").unwrap();
+        set(&mut after, "qbittorrent_password", &stored);
+        let server = server(&[before.clone(), before, after], ok()).await;
+        let r = configure("m", &mylar(&server), None, Some(&qbit()), true)
+            .await
+            .unwrap();
+        assert!(r.applied && r.verified, "{r:?}");
+        let keys: Vec<&str> = r.changes.iter().map(|c| c.key.as_str()).collect();
+        for k in [
+            "torrent_downloader",
+            "qbittorrent_host",
+            "qbittorrent_username",
+            "qbittorrent_password",
+            "qbittorrent_label",
+        ] {
+            assert!(keys.contains(&k), "{k} in {keys:?}");
+        }
+        assert!(!format!("{r:?}").contains("QBPASS"));
+        let posted = posted_form(&server).await;
+        let get = |k: &str| {
+            posted
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("qbittorrent_password"), Some("QBPASS"));
+        assert_eq!(get("torrent_downloader"), Some("5"));
+        assert_eq!(get("enable_torrents"), Some("True"));
+    }
+
+    #[tokio::test]
+    async fn torrent_client_dry_run_writes_nothing() {
+        let server = server(&[table(&[("usenet_retention", "6000")])], ok()).await;
+        let r = configure("m", &mylar(&server), None, Some(&qbit()), false)
+            .await
+            .unwrap();
+        assert!(r.dry_run && !r.in_sync && !r.applied);
+        assert_eq!(writes(&server).await, 0);
+    }
+
+    #[test]
+    fn plan_torrent_refuses_a_usenet_client() {
+        let client = ResolvedDownloadClient {
+            provider: Some(acquisition::ClientProvider::Sabnzbd),
+            ..qbit()
+        };
+        assert!(plan_torrent(&ini(&table(&[])), &client).is_err());
     }
 
     #[test]
@@ -892,7 +1029,7 @@ mod tests {
     #[tokio::test]
     async fn zero_retention_is_rejected() {
         let server = server(&[table(&[])], ok()).await;
-        assert!(configure("m", &mylar(&server), Some(0), false)
+        assert!(configure("m", &mylar(&server), Some(0), None, false)
             .await
             .is_err());
         assert_eq!(writes(&server).await, 0);
