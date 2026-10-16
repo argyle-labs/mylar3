@@ -92,7 +92,9 @@ pub struct ConfigureArgs {
     #[serde(default)]
     pub usenet_retention: Option<u32>,
     /// Torrent downloader to select and configure: `qbittorrent`, `deluge`,
-    /// `transmission`, `rtorrent` or `utorrent`.
+    /// `transmission`, `rtorrent`, `utorrent` or `watchdir`. `deluge` always
+    /// needs `torrent_username` and its password secret; `watchdir` takes no
+    /// credentials.
     #[arg(long)]
     #[serde(default)]
     pub torrent_client: Option<String>,
@@ -126,8 +128,9 @@ pub struct ConfigureArgs {
 /// **Fix settings drift**: `usenet_retention` against the target, and
 /// `nzb_downloader` when SABnzbd is fully set up but unused (otherwise listed as
 /// `manual`), and the torrent downloader when `torrent_client` is given.
-/// Mylar's only settings writer is its all-or-nothing web form, so `execute` re-posts every checkbox and provider at its current value with the
-/// changes applied, refusing when this Mylar's form does not match. It fails
+/// Mylar's only settings writer is its all-or-nothing web form, so `execute`
+/// re-posts every checkbox and provider at its current value with the changes
+/// applied, refusing when this Mylar's form does not match. It fails
 /// if the settings moved since the plan, or if anything other than the changes
 /// moved on write. Without `execute`, reports drift and changes nothing.
 #[orca_tool(
@@ -183,15 +186,21 @@ fn torrent_client(
         return Ok(None);
     };
     let provider = torrent_provider(client)?;
-    let secret = args
-        .torrent_username
-        .as_deref()
-        .filter(|u| !u.is_empty())
-        .map(|_| {
-            args.torrent_password_secret
-                .clone()
-                .unwrap_or_else(|| "mylar3.torrent_password".to_string())
-        });
+    let username = args.torrent_username.as_deref().filter(|u| !u.is_empty());
+    match (provider, username) {
+        (ClientProvider::Watchdir, Some(_)) => {
+            bail!("torrent_client 'watchdir' takes no torrent_username")
+        }
+        (ClientProvider::Deluge, None) => {
+            bail!("torrent_client 'deluge' needs torrent_username and its password secret")
+        }
+        _ => {}
+    }
+    let secret = username.map(|_| {
+        args.torrent_password_secret
+            .clone()
+            .unwrap_or_else(|| "mylar3.torrent_password".to_string())
+    });
     let password = match (&secret, args.execute) {
         (Some(secret), true) => Some(get_secret(secret)?),
         (Some(_), false) => Some(DRY_RUN_PASSWORD.to_string()),
@@ -389,6 +398,19 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(secret.is_none() && c.username.is_none() && c.password.is_none());
+    }
+
+    #[test]
+    fn torrent_client_rejects_credentials_it_cannot_use_before_the_secret() {
+        let no_read = |_: &str| -> Result<String> { bail!("secret read") };
+        let mut args = torrent_args(Some("admin"), None, true);
+        args.torrent_client = Some("watchdir".into());
+        let err = torrent_client(&args, no_read).unwrap_err().to_string();
+        assert!(err.contains("takes no torrent_username"), "{err}");
+        let mut args = torrent_args(None, None, true);
+        args.torrent_client = Some("deluge".into());
+        let err = torrent_client(&args, no_read).unwrap_err().to_string();
+        assert!(err.contains("needs torrent_username"), "{err}");
     }
 
     #[test]
