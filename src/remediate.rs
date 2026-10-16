@@ -1,6 +1,3 @@
-//! Remediation: `mylar3.configure` (settings drift) and `mylar3.backlog.process`
-//! (import finished downloads Mylar never picked up).
-
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::scrub;
 use plugin_toolkit::time::Timestamp;
@@ -10,8 +7,6 @@ use crate::api::{ConfigIni, Mylar};
 use crate::definitions::CONFIG_KEYS;
 use crate::{secret, status};
 
-/// `checked_configs` in Mylar's `configUpdate` (`mylar/webserve.py`): the form's
-/// checkboxes, which it sets False whenever they are not posted.
 const FORM_CHECKBOXES: &[&str] = &[
     "enable_https",
     "launch_browser",
@@ -110,8 +105,6 @@ const FORM_CHECKBOXES: &[&str] = &[
     "deluge_pause",
 ];
 
-/// Provider lists `configUpdate` rebuilds from posted `<prefix>_<field><id>` rows
-/// and empties when none are posted. Field order is Mylar's stored tuple order.
 const PROVIDER_LISTS: &[(&str, &str, [&str; 6])] = &[
     (
         "extra_newznabs",
@@ -125,12 +118,8 @@ const PROVIDER_LISTS: &[(&str, &str, [&str; 6])] = &[
     ),
 ];
 
-/// Keys an older Mylar defined and v0.11.0 dropped. v0.11.0 never deletes them
-/// from `config.ini`, so upgraded instances still serve them; nothing reads them,
-/// so they are neither a form difference nor re-posted.
 const RETIRED_KEYS: &[&str] = &["host_return"];
 
-/// Secret-bearing keys `scrub::is_sensitive_key` does not recognise.
 const MYLAR_SECRETS: &[&str] = &[
     "extra_newznabs",
     "extra_torznabs",
@@ -144,8 +133,6 @@ const MYLAR_SECRETS: &[&str] = &[
     "pp_sshpasswd",
 ];
 
-/// Prefix of a value Mylar stored with `encrypt_passwords`:
-/// `^~$z$` + base64(secret + 8-byte salt), re-salted on every save.
 const ENCRYPTED_PREFIX: &str = "^~$z$";
 
 pub const DEFAULT_USENET_RETENTION: u32 = 6000;
@@ -173,15 +160,10 @@ pub struct ConfigureReport {
     /// Mylar accepted the settings form.
     pub applied: bool,
     /// A re-read after the write shows every change and nothing else moved.
-    /// `/getConfig` serves Mylar's in-memory settings, so this does not prove
-    /// the `config.ini` write reached disk.
     pub verified: bool,
     pub dry_run: bool,
 }
 
-/// `usenet_retention`: an explicit target is matched exactly; without one, only
-/// values below [`DEFAULT_USENET_RETENTION`] are raised, so a longer retention
-/// an operator chose is never cut.
 pub fn plan(ini: &ConfigIni, usenet_retention: Option<u32>) -> (Vec<SettingChange>, Vec<String>) {
     let mut changes = Vec::new();
     let mut manual = Vec::new();
@@ -204,8 +186,6 @@ pub fn plan(ini: &ConfigIni, usenet_retention: Option<u32>) -> (Vec<SettingChang
         && ini.int("nzb_downloader") == Some(3)
         && ini.get("sab_host").is_some()
     {
-        // With SABnzbd selected, Mylar's configure() fills a missing SAB path
-        // mapping in memory only, so the switch is safe only once it is set.
         let mapped = ini.get("sab_directory").is_some() || ini.flag("sab_to_mylar") == Some(true);
         if ini.get("sab_apikey").is_some() && mapped {
             changes.push(SettingChange {
@@ -270,13 +250,7 @@ pub fn plan_torrent(
     Ok((shown, posted))
 }
 
-/// The `/configUpdate` body that applies `changes`. Mylar sets every
-/// [`FORM_CHECKBOXES`] key not posted to False and replaces both provider lists
-/// with the rows posted, while other keys keep their value unless posted. So
-/// this posts the changes, every checkbox at its current value, and every
-/// provider row; it refuses when that state cannot be read exactly.
 pub fn form(ini: &ConfigIni, changes: &[SettingChange]) -> Result<Vec<(String, String)>> {
-    // A minimal ini omits defaulted keys, so an absent checkbox's value is unknown.
     if ini.flag("minimal_ini") != Some(false) {
         bail!("minimal_ini is not False: config.ini may omit default values, so the settings form cannot be re-posted unchanged");
     }
@@ -291,8 +265,6 @@ pub fn form(ini: &ConfigIni, changes: &[SettingChange]) -> Result<Vec<(String, S
             missing.join(", ")
         );
     }
-    // A key outside v0.11.0's definitions may be a checkbox another version's
-    // form has, which this re-post would turn off.
     let unknown: Vec<&str> = ini
         .0
         .keys()
@@ -325,14 +297,12 @@ pub fn form(ini: &ConfigIni, changes: &[SettingChange]) -> Result<Vec<(String, S
         let mut ids = std::collections::BTreeSet::new();
         for row in parts.chunks(7) {
             let id = row[6];
-            // A misparsed row can shift an API key into the id column; never echo it.
             if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
                 bail!("{ini_key} has a provider row with a non-numeric id; refusing to re-post it");
             }
             if !ids.insert(id) {
                 bail!("{ini_key} has two provider rows with id {id}; refusing to re-post it");
             }
-            // configUpdate renames a nameless row after its host, or drops it.
             if row[0].is_empty() {
                 bail!("{ini_key} provider {id} has no name; re-posting would rename or delete it");
             }
@@ -347,7 +317,6 @@ pub fn form(ini: &ConfigIni, changes: &[SettingChange]) -> Result<Vec<(String, S
     Ok(fields)
 }
 
-/// Values compare by plaintext: an encrypted value is re-salted on every save.
 fn normalized(v: &str) -> std::borrow::Cow<'_, [u8]> {
     let Some(b64) = v.strip_prefix(ENCRYPTED_PREFIX) else {
         return v.as_bytes().into();
@@ -383,15 +352,12 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Values shown in diffs: form checkboxes (gotify's hold a URL and token) and
-/// the planned keys. Everything else may be a reversible secret.
 fn shown(key: &str, planned: &[SettingChange]) -> bool {
     let visible = (FORM_CHECKBOXES.contains(&key) && !key.starts_with("gotify_"))
         || planned.iter().any(|c| c.key == key);
     visible && !scrub::is_sensitive_key(key) && !MYLAR_SECRETS.contains(&key)
 }
 
-/// Keys whose value moved between `before` and `after`, other than `planned`.
 fn changed<'a>(
     before: &'a ConfigIni,
     after: &'a ConfigIni,
@@ -407,8 +373,6 @@ fn changed<'a>(
         .collect()
 }
 
-/// `key: before -> after` for each [`changed`] key, values outside [`shown`]
-/// redacted.
 fn diff(before: &ConfigIni, after: &ConfigIni, planned: &[SettingChange]) -> Vec<String> {
     changed(before, after, planned)
         .into_iter()
@@ -423,8 +387,6 @@ fn diff(before: &ConfigIni, after: &ConfigIni, planned: &[SettingChange]) -> Vec
         .collect()
 }
 
-/// Plan the drift; with `execute`, submit the settings form and re-read to
-/// confirm the changes landed and nothing else moved.
 pub async fn configure(
     name: &str,
     m: &Mylar,
@@ -539,20 +501,17 @@ pub struct BacklogProcess {
     pub name: String,
     /// The requested folder with `.` and repeated or trailing `/` removed.
     pub folder: String,
-    /// Which Mylar download folder contains `folder`, e.g. `sab_directory /downloads`.
+    /// Which Mylar download folder contains `folder`, e.g.
     pub allowed_by: String,
     /// Issues stuck at Snatched past the threshold before this call.
     pub stuck_snatched: usize,
     pub stuck_hours: u32,
-    /// Mylar accepted the post-processing request. It runs in Mylar's queue;
-    /// re-run `mylar3.status` to watch `stuck_snatched` fall.
+    /// Mylar accepted the post-processing request.
     pub queued: bool,
     pub mylar_reply: Option<String>,
     pub dry_run: bool,
 }
 
-/// Path components of an absolute path, with `.` and empty segments dropped;
-/// `None` for a relative path or one with `..`.
 fn components(path: &str) -> Option<Vec<&str>> {
     if !path.starts_with('/') {
         return None;
@@ -564,9 +523,6 @@ fn components(path: &str) -> Option<Vec<&str>> {
     (!parts.contains(&"..")).then_some(parts)
 }
 
-/// Checks `folder` against Mylar's settings: never the library
-/// (`destination_dir`) or anything containing or inside it, and always inside a
-/// download folder Mylar post-processes from.
 pub fn check_folder(ini: &ConfigIni, folder: &str) -> Result<(String, String)> {
     let parts = components(folder).ok_or_else(|| {
         anyhow!("folder must be an absolute path without `..`, as Mylar's container sees it")
@@ -592,7 +548,6 @@ pub fn check_folder(ini: &ConfigIni, folder: &str) -> Result<(String, String)> {
         .filter_map(|k| ini.get(k).map(|v| (k, v)))
         .collect();
     for (key, root) in &roots {
-        // A root of `/` has no components and would contain every path.
         if components(root).is_some_and(|r| !r.is_empty() && parts.starts_with(&r)) {
             return Ok((resolved, format!("{key} {root}")));
         }
@@ -642,7 +597,6 @@ mod tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// `checked_configs` from Mylar v0.11.0 `mylar/webserve.py`, verbatim.
     const UPSTREAM_V0110: &str = r#"['enable_https', 'launch_browser', 'backup_on_start', 'keep_html_cache', 'syno_fix', 'auto_update', 'annuals_on', 'api_enabled', 'nzb_startup_search',
 'enforce_perms', 'sab_to_mylar', 'torrent_local', 'torrent_seedbox', 'rtorrent_ssl', 'rtorrent_verify', 'rtorrent_startonload', 'qbittorrent_ignore_ssl',
 'enable_torrents', 'enable_rss', 'experimental', 'enable_torrent_search', 'enable_32p', 'enable_torznab',
@@ -656,8 +610,6 @@ mod tests {
 'email_enabled', 'email_enc', 'email_ongrab', 'email_onpost', 'gotify_enabled', 'gotify_server_url', 'gotify_token', 'gotify_onsnatch', 'opds_enable', 'opds_authentication', 'opds_metainfo', 'opds_pagesize', 'enable_ddl',
 'enable_getcomics', 'enable_airdcpp', 'jd2_enable', 'enable_external_server', 'ddl_prefer_upscaled', 'deluge_pause']"#;
 
-    /// A full, non-minimal settings table: every checkbox, two newznabs, one
-    /// torznab, a library and download folders.
     fn table(overrides: &[(&str, &str)]) -> Vec<(String, String)> {
         let mut rows: Vec<(String, String)> = FORM_CHECKBOXES
             .iter()
@@ -712,7 +664,6 @@ mod tests {
         json!({ "aaData": rows.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>() })
     }
 
-    /// Serve `reads` as successive `/getConfig` replies; the last repeats.
     async fn server(reads: &[Vec<(String, String)>], update: ResponseTemplate) -> MockServer {
         let server = MockServer::start().await;
         for (i, rows) in reads.iter().enumerate() {
@@ -1391,7 +1342,6 @@ mod tests {
         let before = ini(&table(&[("sab_apikey", "^~$z$S0VZMXNhbHRzYWx0")]));
         let resalted = ini(&table(&[("sab_apikey", "^~$z$S0VZMXBlcHBlcjEy")]));
         assert!(diff(&before, &resalted, &[]).is_empty());
-        // Non-UTF-8 plaintexts that a lossy decode would render identically.
         let a = ini(&table(&[("sab_apikey", "^~$z$/3NhbHRzYWx0")]));
         let b = ini(&table(&[("sab_apikey", "^~$z$/nNhbHRzYWx0")]));
         assert_eq!(diff(&a, &b, &[]).len(), 1);

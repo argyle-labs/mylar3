@@ -1,12 +1,3 @@
-//! Targeted edits to Mylar's `config.ini` text.
-//!
-//! Mylar writes the file with Python's `configparser`: `[Section]` headers and
-//! `key = value` lines, keys lowercased. An edit replaces only the value of the
-//! named key in the named section and leaves every other byte as it was; a key
-//! missing from its section is appended to that section, and a missing section
-//! is appended to the file.
-
-/// Set `key` to `value` in `[section]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
     pub section: String,
@@ -14,16 +5,11 @@ pub struct Edit {
     pub value: String,
 }
 
-/// An edit that configparser could not read back as written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditError {
     Section(String),
-    /// Only the text before any `=`/`:`, so a mistyped `key=secret` isn't echoed.
     Key(String),
-    /// Names the key, not the value: values can be secrets.
-    Value {
-        key: String,
-    },
+    Value { key: String },
 }
 
 impl std::fmt::Display for EditError {
@@ -38,7 +24,6 @@ impl std::fmt::Display for EditError {
 
 impl std::error::Error for EditError {}
 
-/// `text` with every edit applied; nothing is applied if any edit is invalid.
 pub fn rewrite(text: &str, edits: &[Edit]) -> Result<String, EditError> {
     for e in edits {
         validate(e)?;
@@ -64,25 +49,21 @@ fn validate(e: &Edit) -> Result<(), EditError> {
         let shown = e.key.split(['=', ':']).next().unwrap_or_default();
         return Err(EditError::Key(shown.to_string()));
     }
-    // configparser strips values on read, so edge whitespace would not survive.
     if breaks(&e.value) || e.value.trim() != e.value {
         return Err(EditError::Value { key: e.key.clone() });
     }
     Ok(())
 }
 
-/// The value of `key` in `[section]` as configparser reads it: trimmed,
-/// continuation lines joined with `\n`, and `%%` unescaped to `%`. `None` if
-/// the value holds any other `%`, which BasicInterpolation rejects or expands.
 pub fn get(text: &str, section: &str, key: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let entry = entries(&lines)
         .into_iter()
         .find(|en| en.section == Some(section) && en.key.eq_ignore_ascii_case(key))?;
-    let first = lines[entry.line][entry.delim + 1..].trim();
+    let first = lines[entry.line][entry.delim_offset + 1..].trim();
     let mut value = vec![first];
     value.extend(
-        lines[entry.line + 1..entry.end]
+        lines[entry.line + 1..entry.value_end_line]
             .iter()
             .filter(|l| !is_comment(l))
             .map(|l| l.trim()),
@@ -102,19 +83,14 @@ fn unescape(raw: &str) -> Option<String> {
     Some(out)
 }
 
-/// A `key = value` line and the lines its value spans.
 struct Entry<'a> {
     section: Option<&'a str>,
     key: &'a str,
     line: usize,
-    /// Byte offset of the `=` or `:` in the key line.
-    delim: usize,
-    /// One past the value's last non-blank continuation line.
-    end: usize,
+    delim_offset: usize,
+    value_end_line: usize,
 }
 
-/// A `[name]` header; configparser keeps the name's inner whitespace, runs the
-/// name to the last `]`, and ignores text after it.
 fn header(line: &str) -> Option<&str> {
     let rest = line.trim().strip_prefix('[')?;
     let name = &rest[..rest.rfind(']')?];
@@ -129,10 +105,6 @@ fn indent(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// Every entry in `lines`, read with configparser's defaults. A non-blank line
-/// indented deeper than the key line continues the value, even across blank
-/// and comment lines (`empty_lines_in_values`); comments are skipped, not part
-/// of the value.
 fn entries<'a>(lines: &[&'a str]) -> Vec<Entry<'a>> {
     let mut out: Vec<Entry<'a>> = Vec::new();
     let mut section = None;
@@ -148,7 +120,7 @@ fn entries<'a>(lines: &[&'a str]) -> Vec<Entry<'a>> {
         if let Some(at) = open {
             if indent(line) > at {
                 if let Some(last) = out.last_mut() {
-                    last.end = i + 1;
+                    last.value_end_line = i + 1;
                 }
                 continue;
             }
@@ -164,8 +136,8 @@ fn entries<'a>(lines: &[&'a str]) -> Vec<Entry<'a>> {
                 section,
                 key: line[..delim].trim(),
                 line: i,
-                delim,
-                end: i + 1,
+                delim_offset: delim,
+                value_end_line: i + 1,
             });
         }
     }
@@ -174,9 +146,7 @@ fn entries<'a>(lines: &[&'a str]) -> Vec<Entry<'a>> {
 
 fn apply(text: &str, e: &Edit) -> String {
     let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    // Lines keep their own terminators so untouched lines round-trip exactly.
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    // Mylar writes through BasicInterpolation, which reads `%%` as `%`.
     let value = e.value.replace('%', "%%");
     let found = entries(&lines);
     let in_section: Vec<&Entry> = found
@@ -189,7 +159,7 @@ fn apply(text: &str, e: &Edit) -> String {
     {
         let line = lines[en.line];
         let body = line.trim_end_matches(['\r', '\n']);
-        let pos = en.delim;
+        let pos = en.delim_offset;
         let after = &body[pos + 1..];
         let mut gap = &after[..after.len() - after.trim_start().len()];
         if gap.is_empty() && !value.is_empty() && body[..pos].ends_with([' ', '\t']) {
@@ -201,20 +171,19 @@ fn apply(text: &str, e: &Edit) -> String {
         for (j, l) in lines.iter().enumerate() {
             if j == en.line {
                 out.push_str(&replaced);
-            } else if j < en.line || j >= en.end {
+            } else if j < en.line || j >= en.value_end_line {
                 out.push_str(l);
             }
         }
         return out;
     }
-    // configparser lowercases keys on write.
     let entry = format!("{} = {value}", e.key.to_ascii_lowercase());
     let header_line = lines
         .iter()
         .rposition(|l| header(l.trim_end_matches(['\r', '\n'])) == Some(e.section.as_str()));
     let at = in_section
         .last()
-        .map(|en| en.end)
+        .map(|en| en.value_end_line)
         .or(header_line.map(|h| h + 1));
     match at {
         Some(at) => {
@@ -367,7 +336,6 @@ mod tests {
 
     #[test]
     fn empty_values_as_configparser_writes_them() {
-        // configparser writes an empty value as `key = ` with the trailing space.
         let text = "[Client]\nsab_host = \nsab_port =\n";
         assert_eq!(get(text, "Client", "sab_host").as_deref(), Some(""));
         assert_eq!(get(text, "Client", "sab_port").as_deref(), Some(""));

@@ -1,6 +1,3 @@
-//! Every option Mylar v0.11.0 defines (`_CONFIG_DEFINITIONS` in
-//! `mylar/config.py`), lowercased as `config.ini` and `/getConfig` name them.
-
 pub const CONFIG_KEYS: &[&str] = &[
     "add_comics",
     "add_to_csv",
@@ -391,7 +388,6 @@ pub const CONFIG_KEYS: &[&str] = &[
 mod tests {
     use super::*;
 
-    /// sha256 of the v0.11.0 key names, sorted and newline-joined.
     const V0110_SHA256: &str = "a20bedff8feaef7634bd87ba5a64370d8600f49d5f798db6508ebe110e06c79c";
 
     #[test]
