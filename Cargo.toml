@@ -20,11 +20,11 @@ path = "src/main.rs"
 # detect/remediate tools over the orca socket, reaching orca through
 # plugin-toolkit alone.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit" }
 getrandom = "0.3"
 
 [dev-dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit" }
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 wiremock = "0.6"
