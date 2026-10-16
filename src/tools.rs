@@ -10,6 +10,7 @@
 
 use plugin_toolkit::prelude::*;
 
+use crate::acquisition::{ClientProvider, ResolvedDownloadClient};
 use crate::api::Mylar;
 use crate::execute;
 use crate::remediate::{self, BacklogProcess, ConfigureReport};
@@ -90,6 +91,32 @@ pub struct ConfigureArgs {
     #[arg(long)]
     #[serde(default)]
     pub usenet_retention: Option<u32>,
+    /// Torrent downloader to select and configure: `qbittorrent`, `deluge`,
+    /// `transmission`, `rtorrent` or `utorrent`.
+    #[arg(long)]
+    #[serde(default)]
+    pub torrent_client: Option<String>,
+    /// Torrent client base URL as Mylar reaches it, e.g. `http://10.0.0.16:8080`.
+    #[arg(long)]
+    #[serde(default)]
+    pub torrent_url: Option<String>,
+    #[arg(long)]
+    #[serde(default)]
+    pub torrent_username: Option<String>,
+    /// orca secret holding the torrent client password, read only on
+    /// `execute`. Omitted, with `torrent_username` set, reads
+    /// `mylar3.torrent_password`.
+    #[arg(long)]
+    #[serde(default)]
+    pub torrent_password_secret: Option<String>,
+    /// Category or label Mylar files torrents under; defaults to `comics`.
+    #[arg(long)]
+    #[serde(default)]
+    pub torrent_category: Option<String>,
+    /// Folder the torrent client saves into, as the client sees it.
+    #[arg(long)]
+    #[serde(default)]
+    pub torrent_directory: Option<String>,
     /// Apply. Omitted, reports drift and changes nothing.
     #[arg(long)]
     #[serde(default)]
@@ -98,8 +125,8 @@ pub struct ConfigureArgs {
 
 /// **Fix settings drift**: `usenet_retention` against the target, and
 /// `nzb_downloader` when SABnzbd is fully set up but unused (otherwise listed as
-/// `manual`). Mylar's only settings writer is its all-or-nothing web form, so
-/// `execute` re-posts every checkbox and provider at its current value with the
+/// `manual`), and the torrent downloader when `torrent_client` is given.
+/// Mylar's only settings writer is its all-or-nothing web form, so `execute` re-posts every checkbox and provider at its current value with the
 /// changes applied, refusing when this Mylar's form does not match. It fails
 /// if the settings moved since the plan, or if anything other than the changes
 /// moved on write. Without `execute`, reports drift and changes nothing.
@@ -112,8 +139,82 @@ pub struct ConfigureArgs {
 async fn mylar3_configure(args: ConfigureArgs, ctx: &ToolCtx) -> Result<ConfigureReport> {
     const TOOL: &str = "mylar3.configure";
     execute::require_admin(TOOL, ctx)?;
+    let torrent = torrent_client(&args, plugin_toolkit::secrets::get_required)?;
     let m = connect(&args.name).await?;
-    remediate::configure(&args.name, &m, args.usenet_retention, args.execute).await
+    let mut report = remediate::configure(
+        &args.name,
+        &m,
+        args.usenet_retention,
+        torrent.as_ref().map(|(c, _)| c),
+        args.execute,
+    )
+    .await?;
+    if let Some((_, Some(secret))) = torrent.filter(|_| !args.execute) {
+        for c in report
+            .changes
+            .iter_mut()
+            .filter(|c| c.key.ends_with("_password"))
+        {
+            c.target = format!("will be set from secret {secret}");
+        }
+    }
+    Ok(report)
+}
+
+const DRY_RUN_PASSWORD: &str = "dry-run-placeholder";
+
+fn torrent_provider(name: &str) -> Result<ClientProvider> {
+    Ok(match name {
+        "qbittorrent" => ClientProvider::Qbittorrent,
+        "deluge" => ClientProvider::Deluge,
+        "transmission" => ClientProvider::Transmission,
+        "rtorrent" => ClientProvider::Rtorrent,
+        "utorrent" => ClientProvider::Utorrent,
+        "watchdir" => ClientProvider::Watchdir,
+        other => bail!("unknown torrent_client '{other}'"),
+    })
+}
+
+fn torrent_client(
+    args: &ConfigureArgs,
+    get_secret: impl Fn(&str) -> Result<String>,
+) -> Result<Option<(ResolvedDownloadClient, Option<String>)>> {
+    let Some(client) = args.torrent_client.as_deref() else {
+        return Ok(None);
+    };
+    let provider = torrent_provider(client)?;
+    let secret = args
+        .torrent_username
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .map(|_| {
+            args.torrent_password_secret
+                .clone()
+                .unwrap_or_else(|| "mylar3.torrent_password".to_string())
+        });
+    let password = match (&secret, args.execute) {
+        (Some(secret), true) => Some(get_secret(secret)?),
+        (Some(_), false) => Some(DRY_RUN_PASSWORD.to_string()),
+        (None, _) => None,
+    };
+    let (directory, client_directory) = match provider {
+        ClientProvider::Watchdir => (args.torrent_directory.clone(), None),
+        _ => (None, args.torrent_directory.clone()),
+    };
+    Ok(Some((
+        ResolvedDownloadClient {
+            provider: Some(provider),
+            name: client.to_string(),
+            url: args.torrent_url.clone(),
+            username: args.torrent_username.clone(),
+            password,
+            category: args.torrent_category.clone(),
+            directory,
+            client_directory,
+            ..Default::default()
+        },
+        secret,
+    )))
 }
 
 #[orca_struct(args)]
@@ -196,6 +297,12 @@ mod tests {
             let args = ConfigureArgs {
                 name: "m".into(),
                 usenet_retention: None,
+                torrent_client: None,
+                torrent_url: None,
+                torrent_username: None,
+                torrent_password_secret: None,
+                torrent_category: None,
+                torrent_directory: None,
                 execute: false,
             };
             let err = mylar3_configure(args, &ctx(role))
@@ -204,6 +311,95 @@ mod tests {
                 .to_string();
             assert!(err.starts_with("mylar3.configure"), "{err}");
         }
+    }
+
+    #[test]
+    fn torrent_provider_names() {
+        assert_eq!(
+            torrent_provider("qbittorrent").unwrap(),
+            ClientProvider::Qbittorrent
+        );
+        assert_eq!(
+            torrent_provider("watchdir").unwrap(),
+            ClientProvider::Watchdir
+        );
+        assert!(torrent_provider("sabnzbd").is_err());
+    }
+
+    fn torrent_args(username: Option<&str>, secret: Option<&str>, execute: bool) -> ConfigureArgs {
+        ConfigureArgs {
+            name: "m".into(),
+            usenet_retention: None,
+            torrent_client: Some("qbittorrent".into()),
+            torrent_url: Some("http://10.0.0.16:8080".into()),
+            torrent_username: username.map(str::to_string),
+            torrent_password_secret: secret.map(str::to_string),
+            torrent_category: None,
+            torrent_directory: None,
+            execute,
+        }
+    }
+
+    fn vault(name: &str) -> Result<String> {
+        match name {
+            "mylar3.torrent_password" => Ok("DEFAULT".into()),
+            "mylar3.m.torrent_password" => Ok("SCOPED".into()),
+            other => bail!("no secret named '{other}'"),
+        }
+    }
+
+    #[test]
+    fn torrent_client_reads_the_plugin_scoped_secret_by_default() {
+        let (c, secret) = torrent_client(&torrent_args(Some("admin"), None, true), vault)
+            .unwrap()
+            .unwrap();
+        assert_eq!(secret.as_deref(), Some("mylar3.torrent_password"));
+        assert_eq!(c.password.as_deref(), Some("DEFAULT"));
+    }
+
+    #[test]
+    fn torrent_client_reads_an_explicit_secret() {
+        let args = torrent_args(Some("admin"), Some("mylar3.m.torrent_password"), true);
+        let (c, _) = torrent_client(&args, vault).unwrap().unwrap();
+        assert_eq!(c.password.as_deref(), Some("SCOPED"));
+    }
+
+    #[test]
+    fn torrent_client_fails_on_a_missing_secret() {
+        let args = torrent_args(Some("admin"), Some("absent"), true);
+        let err = torrent_client(&args, vault).unwrap_err().to_string();
+        assert!(err.contains("absent"), "{err}");
+    }
+
+    #[test]
+    fn torrent_client_dry_run_does_not_read_the_secret() {
+        let args = torrent_args(Some("admin"), Some("absent"), false);
+        let (c, secret) = torrent_client(&args, |_| bail!("read on dry run"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(secret.as_deref(), Some("absent"));
+        assert_eq!(c.password.as_deref(), Some(DRY_RUN_PASSWORD));
+    }
+
+    #[test]
+    fn torrent_client_without_username_sets_no_credentials() {
+        let (c, secret) = torrent_client(&torrent_args(None, None, true), |_| {
+            bail!("read without a username")
+        })
+        .unwrap()
+        .unwrap();
+        assert!(secret.is_none() && c.username.is_none() && c.password.is_none());
+    }
+
+    #[test]
+    fn torrent_client_watchdir_uses_the_directory() {
+        let mut args = torrent_args(None, None, true);
+        args.torrent_client = Some("watchdir".into());
+        args.torrent_directory = Some("/watch".into());
+        let (c, _) = torrent_client(&args, vault).unwrap().unwrap();
+        assert_eq!(c.provider, Some(ClientProvider::Watchdir));
+        assert_eq!(c.directory.as_deref(), Some("/watch"));
+        assert!(c.client_directory.is_none());
     }
 
     #[tokio::test]
