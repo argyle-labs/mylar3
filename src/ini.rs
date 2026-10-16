@@ -24,6 +24,10 @@ impl std::fmt::Display for EditError {
 
 impl std::error::Error for EditError {}
 
+fn survives_configparser_strip(value: &str) -> bool {
+    value.trim() == value
+}
+
 pub fn rewrite(text: &str, edits: &[Edit]) -> Result<String, EditError> {
     for e in edits {
         validate(e)?;
@@ -49,7 +53,7 @@ fn validate(e: &Edit) -> Result<(), EditError> {
         let shown = e.key.split(['=', ':']).next().unwrap_or_default();
         return Err(EditError::Key(shown.to_string()));
     }
-    if breaks(&e.value) || e.value.trim() != e.value {
+    if breaks(&e.value) || !survives_configparser_strip(&e.value) {
         return Err(EditError::Value { key: e.key.clone() });
     }
     Ok(())

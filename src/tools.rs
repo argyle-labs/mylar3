@@ -71,15 +71,15 @@ pub struct ConfigureArgs {
     /// Registered mylar3 endpoint name.
     #[arg(long)]
     pub name: String,
-    /// Days of usenet retention to advertise to indexers (newznab `maxage`), matched exactly.
+    /// Days of usenet retention advertised to indexers (newznab `maxage`); omitted, raises anything below 6000 to 6000.
     #[arg(long)]
     #[serde(default)]
     pub usenet_retention: Option<u32>,
-    /// Torrent downloader to configure: qbittorrent, deluge, transmission, rtorrent, utorrent or watchdir.
+    /// Torrent downloader to configure: qbittorrent, deluge (needs a username), transmission, rtorrent, utorrent or watchdir (no credentials).
     #[arg(long)]
     #[serde(default)]
     pub torrent_client: Option<String>,
-    /// Torrent client base URL as Mylar reaches it, e.g.
+    /// Torrent client base URL as Mylar reaches it, e.g. `http://10.0.0.16:8080`.
     #[arg(long)]
     #[serde(default)]
     pub torrent_url: Option<String>,
@@ -87,7 +87,7 @@ pub struct ConfigureArgs {
     #[arg(long)]
     #[serde(default)]
     pub torrent_username: Option<String>,
-    /// orca secret holding the torrent client password, read only on `execute`.
+    /// orca secret holding the torrent client password, read only on `execute`; defaults to `mylar3.torrent_password`.
     #[arg(long)]
     #[serde(default)]
     pub torrent_password_secret: Option<String>,
@@ -99,7 +99,7 @@ pub struct ConfigureArgs {
     #[arg(long)]
     #[serde(default)]
     pub torrent_directory: Option<String>,
-    /// Apply.
+    /// Apply the changes; omitted, only reports what would change.
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,
@@ -204,14 +204,14 @@ pub struct BacklogArgs {
     /// Registered mylar3 endpoint name.
     #[arg(long)]
     pub name: String,
-    /// Completed-downloads folder as Mylar's container sees it, e.g.
+    /// Completed-downloads folder as Mylar's container sees it, e.g. `/downloads/completed/comics`.
     #[arg(long)]
     pub folder: String,
     /// Threshold for the stuck-at-Snatched count reported alongside.
     #[arg(long, default_value_t = DEFAULT_STUCK_HOURS)]
     #[serde(default = "default_stuck_hours")]
     pub stuck_hours: u32,
-    /// Apply.
+    /// Queue the post-processor; omitted, only reports the checked folder and stuck count.
     #[arg(long)]
     #[serde(default)]
     pub execute: bool,

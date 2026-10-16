@@ -523,6 +523,10 @@ fn components(path: &str) -> Option<Vec<&str>> {
     (!parts.contains(&"..")).then_some(parts)
 }
 
+fn confining_components(root: &str) -> Option<Vec<&str>> {
+    components(root).filter(|r| !r.is_empty())
+}
+
 pub fn check_folder(ini: &ConfigIni, folder: &str) -> Result<(String, String)> {
     let parts = components(folder).ok_or_else(|| {
         anyhow!("folder must be an absolute path without `..`, as Mylar's container sees it")
@@ -548,7 +552,7 @@ pub fn check_folder(ini: &ConfigIni, folder: &str) -> Result<(String, String)> {
         .filter_map(|k| ini.get(k).map(|v| (k, v)))
         .collect();
     for (key, root) in &roots {
-        if components(root).is_some_and(|r| !r.is_empty() && parts.starts_with(&r)) {
+        if confining_components(root).is_some_and(|r| parts.starts_with(&r)) {
             return Ok((resolved, format!("{key} {root}")));
         }
     }

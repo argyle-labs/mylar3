@@ -333,7 +333,7 @@ fn post_processing_findings(ini: &ConfigIni, pp: &PostProcessingCheck) -> Vec<St
     out
 }
 
-fn mylar_datetime(t: Timestamp) -> String {
+fn utc_as_mylar_local_time(t: Timestamp) -> String {
     t.to_rfc3339()
         .replacen('T', " ", 1)
         .trim_end_matches('Z')
@@ -341,7 +341,8 @@ fn mylar_datetime(t: Timestamp) -> String {
 }
 
 pub fn stuck(history: &[Snatch], threshold_hours: u32, now: Timestamp) -> StuckSnatched {
-    let before = mylar_datetime(now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)));
+    let before =
+        utc_as_mylar_local_time(now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)));
     let mut latest: BTreeMap<&str, &Snatch> = BTreeMap::new();
     let mut grabs: BTreeMap<&str, usize> = BTreeMap::new();
     for s in history {
