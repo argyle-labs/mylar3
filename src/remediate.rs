@@ -227,9 +227,6 @@ pub fn plan(ini: &ConfigIni, usenet_retention: Option<u32>) -> (Vec<SettingChang
     (changes, manual)
 }
 
-/// Changes selecting and configuring `client` as Mylar's torrent downloader:
-/// the reported form with secrets withheld, and the plaintext form to post,
-/// which Mylar encrypts on save.
 pub fn plan_torrent(
     ini: &ConfigIni,
     client: &ResolvedDownloadClient,
@@ -237,7 +234,12 @@ pub fn plan_torrent(
     if client.provider.map(|p| p.protocol()) != Some(Protocol::Torrent) {
         bail!("torrent client '{}' is not a torrent provider", client.name);
     }
-    let diff = acquisition::plan(ini, client)?;
+    let mut diff = acquisition::plan(ini, client)?;
+    if client.username.is_none() && client.password.is_none() {
+        diff.changes.retain(|c| {
+            !(c.setting.key.ends_with("_username") || c.setting.key.ends_with("_password"))
+        });
+    }
     if !diff.ignored.is_empty() {
         bail!(
             "torrent client '{}' has no Mylar setting for [{}]",
@@ -1003,6 +1005,175 @@ mod tests {
             .unwrap();
         assert!(r.dry_run && !r.in_sync && !r.applied);
         assert_eq!(writes(&server).await, 0);
+    }
+
+    fn landed(
+        before: &[(String, String)],
+        client: &ResolvedDownloadClient,
+    ) -> Vec<(String, String)> {
+        let mut after = before.to_vec();
+        for c in plan_torrent(&ini(before), client).unwrap().1 {
+            set(&mut after, &c.key, &c.target);
+        }
+        after
+    }
+
+    fn torrent_base() -> Vec<(String, String)> {
+        table(&[("usenet_retention", "6000"), ("torrent_downloader", "0")])
+    }
+
+    async fn execute_torrent(
+        before: Vec<(String, String)>,
+        after: Vec<(String, String)>,
+        client: &ResolvedDownloadClient,
+    ) -> (Result<ConfigureReport>, Vec<(String, String)>) {
+        let server = server(&[before.clone(), before, after], ok()).await;
+        let r = configure("m", &mylar(&server), None, Some(client), true).await;
+        let form = if writes(&server).await > 0 {
+            posted_form(&server).await
+        } else {
+            Vec::new()
+        };
+        (r, form)
+    }
+
+    fn field<'a>(form: &'a [(String, String)], k: &str) -> Option<&'a str> {
+        form.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[tokio::test]
+    async fn execute_torrent_without_encrypt_passwords_stores_plaintext() {
+        let before = torrent_base();
+        let after = landed(&before, &qbit());
+        assert_eq!(ini(&after).get("qbittorrent_password"), Some("QBPASS"));
+        let (r, form) = execute_torrent(before, after, &qbit()).await;
+        let r = r.unwrap();
+        assert!(r.applied && r.verified, "{r:?}");
+        assert_eq!(field(&form, "qbittorrent_password"), Some("QBPASS"));
+    }
+
+    #[tokio::test]
+    async fn execute_catches_a_torrent_password_that_does_not_land() {
+        let before = torrent_base();
+        let mut after = landed(&before, &qbit());
+        set(&mut after, "qbittorrent_password", "OTHER");
+        let err = execute_torrent(before, after, &qbit())
+            .await
+            .0
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("qbittorrent_password") && err.contains("still drift"),
+            "{err}"
+        );
+        assert!(!err.contains("QBPASS") && !err.contains("OTHER"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn execute_catches_a_torrent_downloader_that_does_not_land() {
+        let before = torrent_base();
+        let mut after = landed(&before, &qbit());
+        set(&mut after, "torrent_downloader", "4");
+        let err = execute_torrent(before, after, &qbit())
+            .await
+            .0
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[torrent_downloader] still drift"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn execute_applies_retention_and_torrent_together() {
+        let before = table(&[("torrent_downloader", "4")]);
+        let mut after = landed(&before, &qbit());
+        set(&mut after, "usenet_retention", "6000");
+        let server = server(&[before.clone(), before, after], ok()).await;
+        let r = configure("m", &mylar(&server), None, Some(&qbit()), true)
+            .await
+            .unwrap();
+        assert!(r.applied && r.verified, "{r:?}");
+        let form = posted_form(&server).await;
+        assert_eq!(field(&form, "usenet_retention"), Some("6000"));
+        assert_eq!(field(&form, "torrent_downloader"), Some("5"));
+        assert_eq!(writes(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn execute_posts_a_clear_as_empty() {
+        let mut before = torrent_base();
+        set(&mut before, "qbittorrent_folder", "/old");
+        let after = landed(&before, &qbit());
+        let (r, form) = execute_torrent(before, after, &qbit()).await;
+        let r = r.unwrap();
+        assert!(r.applied && r.verified, "{r:?}");
+        assert_eq!(field(&form, "qbittorrent_folder"), Some(""));
+    }
+
+    #[tokio::test]
+    async fn dry_run_report_withholds_the_password() {
+        let server = server(&[torrent_base()], ok()).await;
+        let r = configure("m", &mylar(&server), None, Some(&qbit()), false)
+            .await
+            .unwrap();
+        assert!(r.changes.iter().any(|c| c.key == "qbittorrent_password"));
+        assert!(!format!("{r:?}").contains("QBPASS"));
+    }
+
+    #[tokio::test]
+    async fn execute_configures_every_other_torrent_client() {
+        use acquisition::ClientProvider::*;
+        for (provider, selector, prefix) in [
+            (Deluge, "4", "deluge_"),
+            (Transmission, "3", "transmission_"),
+            (Rtorrent, "2", "rtorrent_"),
+            (Utorrent, "1", "utorrent_"),
+        ] {
+            let client = ResolvedDownloadClient {
+                provider: Some(provider),
+                name: format!("{provider:?}"),
+                url: Some("http://10.0.0.16:8080".into()),
+                username: Some("admin".into()),
+                password: Some("PASS".into()),
+                ..Default::default()
+            };
+            let before = torrent_base();
+            let after = landed(&before, &client);
+            let (r, form) = execute_torrent(before, after, &client).await;
+            let r = r.unwrap();
+            assert!(r.applied && r.verified, "{provider:?}: {r:?}");
+            assert_eq!(
+                field(&form, "torrent_downloader"),
+                Some(selector),
+                "{provider:?}"
+            );
+            assert_eq!(field(&form, &format!("{prefix}password")), Some("PASS"));
+            assert_eq!(field(&form, &format!("{prefix}username")), Some("admin"));
+            assert!(!format!("{r:?}").contains("PASS\""), "{provider:?}: {r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_username_leaves_stored_credentials_alone() {
+        let mut before = torrent_base();
+        set(&mut before, "qbittorrent_username", "admin");
+        set(&mut before, "qbittorrent_password", "KEEP");
+        let client = ResolvedDownloadClient {
+            username: None,
+            password: None,
+            ..qbit()
+        };
+        let after = landed(&before, &client);
+        let (r, form) = execute_torrent(before, after, &client).await;
+        let r = r.unwrap();
+        assert!(r.applied && r.verified, "{r:?}");
+        assert!(r
+            .changes
+            .iter()
+            .all(|c| !c.key.ends_with("_username") && !c.key.ends_with("_password")));
+        assert_eq!(field(&form, "qbittorrent_username"), None);
+        assert_eq!(field(&form, "qbittorrent_password"), None);
     }
 
     #[test]
