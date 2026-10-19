@@ -21,7 +21,7 @@ fn encode_with_salt(secret: &str, salt: [u8; SALT_LEN]) -> String {
     format!("{PREFIX}{}", base64_encode(&bytes))
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = chunk

@@ -10,6 +10,9 @@ pub mod secret;
 pub mod status;
 pub mod tools;
 
+#[cfg(test)]
+mod mock;
+
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
     WorkloadSpec,
