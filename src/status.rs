@@ -128,22 +128,28 @@ pub struct StatusReport {
     pub findings: Vec<String>,
     /// No findings and the settings table was readable.
     pub healthy: bool,
+    /// More than `MAX_SERIES_LOOKUPS` series held stuck grabs; the rest were not re-checked.
+    pub series_lookup_limit_hit: bool,
 }
 
 pub async fn status(name: &str, m: &Mylar, stuck_hours: u32) -> Result<StatusReport> {
     let series = m.index().await?.len();
     let wanted = m.wanted().await?;
-    let history = current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
+    let (history, series_lookup_limit_hit) =
+        current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
     let config = m.config().await;
-    Ok(build(
-        name,
-        series,
-        &wanted,
-        &history,
-        config,
-        stuck_hours,
-        Timestamp::now(),
-    ))
+    Ok(StatusReport {
+        series_lookup_limit_hit,
+        ..build(
+            name,
+            series,
+            &wanted,
+            &history,
+            config,
+            stuck_hours,
+            Timestamp::now(),
+        )
+    })
 }
 
 pub fn build(
@@ -223,6 +229,7 @@ pub fn build(
         config_error,
         unknown,
         findings,
+        series_lookup_limit_hit: false,
     }
 }
 
@@ -272,7 +279,7 @@ fn nzb_downloader_name(v: i64) -> String {
 fn post_processing(ini: &ConfigIni) -> PostProcessingCheck {
     PostProcessingCheck {
         nzb_downloader: ini.int("nzb_downloader").map(nzb_downloader_name),
-        sab_host: ini.get("sab_host").map(str::to_string),
+        sab_host: ini.get("sab_host").map(crate::reconcile::strip_userinfo),
         sab_api_key_set: ini
             .has("sab_apikey")
             .then(|| ini.get("sab_apikey").is_some()),
@@ -346,15 +353,16 @@ pub async fn current(
     history: Vec<Snatch>,
     stuck_hours: u32,
     now: Timestamp,
-) -> Result<Vec<Snatch>> {
+) -> Result<(Vec<Snatch>, bool)> {
     let mut seen = BTreeSet::new();
-    let comics: Vec<String> = stuck_snatches(&history, stuck_hours, now)
+    let mut comics: Vec<String> = stuck_snatches(&history, stuck_hours, now)
         .0
         .iter()
         .filter_map(|s| s.comic_id.clone())
         .filter(|id| seen.insert(id.clone()))
-        .take(MAX_SERIES_LOOKUPS)
         .collect();
+    let limit_hit = comics.len() > MAX_SERIES_LOOKUPS;
+    comics.truncate(MAX_SERIES_LOOKUPS);
     let mut moved_on = BTreeSet::new();
     for id in comics {
         let c = m.comic(&id).await?;
@@ -366,7 +374,7 @@ pub async fn current(
                 .filter_map(|i| i.id),
         );
     }
-    Ok(drop_moved_on(history, &moved_on))
+    Ok((drop_moved_on(history, &moved_on), limit_hit))
 }
 
 fn drop_moved_on(history: Vec<Snatch>, moved_on: &BTreeSet<String>) -> Vec<Snatch> {
@@ -542,6 +550,16 @@ mod tests {
             hash: None,
             comic_id: Some("c".into()),
         }
+    }
+
+    #[test]
+    fn status_sab_host_drops_userinfo() {
+        let cfg = ini(&[("sab_host", "http://u:secret@10.0.0.15:8080")]);
+        let s = build("m", 0, &Wanted::default(), &[], Ok(cfg), 24, now());
+        assert_eq!(
+            s.post_processing.sab_host.as_deref(),
+            Some("http://10.0.0.15:8080")
+        );
     }
 
     #[test]
@@ -740,7 +758,8 @@ mod tests {
                 snatch("2", at, "Snatched"),
                 snatch("3", at, "Snatched"),
             ];
-            let kept = current(&m, history, 24, now()).await.unwrap();
+            let (kept, limit_hit) = current(&m, history, 24, now()).await.unwrap();
+            assert!(!limit_hit);
             let s = stuck(&kept, 24, now());
             assert_eq!(s.count, 1);
             assert_eq!(s.sample[0].comic, "C2");
@@ -769,7 +788,8 @@ mod tests {
                     ..snatch(&i.to_string(), "2020-01-01 00:00:00", "Snatched")
                 })
                 .collect();
-            let kept = current(&m, history, 24, now()).await.unwrap();
+            let (kept, limit_hit) = current(&m, history, 24, now()).await.unwrap();
+            assert!(limit_hit);
             assert_eq!(kept.len(), MAX_SERIES_LOOKUPS * 2);
             assert_eq!(
                 server.received_requests().await.unwrap().len(),

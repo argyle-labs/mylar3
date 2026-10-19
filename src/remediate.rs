@@ -510,6 +510,8 @@ pub struct BacklogProcess {
     pub queued: bool,
     pub mylar_reply: Option<String>,
     pub dry_run: bool,
+    /// More than `MAX_SERIES_LOOKUPS` series held stuck grabs; the rest were not re-checked.
+    pub series_lookup_limit_hit: bool,
 }
 
 fn components(path: &str) -> Option<Vec<&str>> {
@@ -575,7 +577,8 @@ pub async fn process_backlog(
         .await
         .context("read Mylar's settings to check the folder")?;
     let (folder, allowed_by) = check_folder(&ini, folder)?;
-    let history = status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
+    let (history, series_lookup_limit_hit) =
+        status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
     let stuck = status::stuck(&history, stuck_hours, Timestamp::now()).count;
     let mylar_reply = if execute {
         Some(m.force_process(&folder).await?)
@@ -591,6 +594,7 @@ pub async fn process_backlog(
         queued: mylar_reply.is_some(),
         mylar_reply,
         dry_run: !execute,
+        series_lookup_limit_hit,
     })
 }
 

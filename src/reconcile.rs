@@ -63,7 +63,7 @@ pub struct ReconcileSummary {
 pub struct ReconcileReport {
     pub name: String,
     pub threshold_hours: u32,
-    /// SAB base URL as Mylar holds it.
+    /// SAB base URL as Mylar holds it, without any `user:pass@`.
     pub sab_host: String,
     pub sab_category: String,
     /// SAB history entries read for the category.
@@ -73,6 +73,8 @@ pub struct ReconcileReport {
     pub offset: usize,
     pub limit: usize,
     pub rows: Vec<ReconciledSnatch>,
+    /// More than `MAX_SERIES_LOOKUPS` series held stuck grabs; the rest were not re-checked.
+    pub series_lookup_limit_hit: bool,
 }
 
 pub async fn reconcile(
@@ -84,19 +86,35 @@ pub async fn reconcile(
 ) -> Result<ReconcileReport> {
     let ini = m.config().await?;
     let (host, key, category) = sab_settings(&ini)?;
-    let history = status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
+    let (history, series_lookup_limit_hit) =
+        status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
     let sab = Sab::new(host, key);
     let slots = sab.history(&category).await?;
-    Ok(build(
+    Ok(build(BuildInput {
         name,
-        sab.base(),
-        &category,
-        &history,
-        &slots,
+        sab_host: sab.base(),
+        category: &category,
+        history: &history,
+        slots: &slots,
         stuck_hours,
-        Timestamp::now(),
-        Page { offset, limit },
-    ))
+        now: Timestamp::now(),
+        page: Page { offset, limit },
+        series_lookup_limit_hit,
+    }))
+}
+
+pub fn strip_userinfo(host: &str) -> String {
+    let (scheme, rest) = host.split_once("://").map_or(("", host), |(s, r)| (s, r));
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let rest = match rest[..end].rfind('@') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
+    if scheme.is_empty() {
+        rest.to_string()
+    } else {
+        format!("{scheme}://{rest}")
+    }
 }
 
 fn sab_settings(ini: &ConfigIni) -> Result<(&str, &str, String)> {
@@ -128,17 +146,30 @@ impl Default for Page {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn build(
-    name: &str,
-    sab_host: &str,
-    category: &str,
-    history: &[Snatch],
-    slots: &[HistorySlot],
-    stuck_hours: u32,
-    now: Timestamp,
-    page: Page,
-) -> ReconcileReport {
+pub struct BuildInput<'a> {
+    pub name: &'a str,
+    pub sab_host: &'a str,
+    pub category: &'a str,
+    pub history: &'a [Snatch],
+    pub slots: &'a [HistorySlot],
+    pub stuck_hours: u32,
+    pub now: Timestamp,
+    pub page: Page,
+    pub series_lookup_limit_hit: bool,
+}
+
+pub fn build(input: BuildInput<'_>) -> ReconcileReport {
+    let BuildInput {
+        name,
+        sab_host,
+        category,
+        history,
+        slots,
+        stuck_hours,
+        now,
+        page,
+        series_lookup_limit_hit,
+    } = input;
     let limit = page.limit.clamp(1, MAX_LIMIT);
     let (stuck, grabs) = status::stuck_snatches(history, stuck_hours, now);
     let named: Vec<(Vec<String>, &HistorySlot)> =
@@ -167,13 +198,14 @@ pub fn build(
     ReconcileReport {
         name: name.to_string(),
         threshold_hours: stuck_hours,
-        sab_host: sab_host.to_string(),
+        sab_host: strip_userinfo(sab_host),
         sab_category: category.to_string(),
         sab_history_entries: slots.len(),
         summary,
         offset: page.offset,
         limit,
         rows,
+        series_lookup_limit_hit,
     }
 }
 
@@ -309,6 +341,38 @@ mod tests {
     use plugin_toolkit::serde_json;
     use std::time::Duration;
 
+    fn input<'a>(history: &'a [Snatch], slots: &'a [HistorySlot], page: Page) -> BuildInput<'a> {
+        BuildInput {
+            name: "m",
+            sab_host: "http://sab",
+            category: "comics",
+            history,
+            slots,
+            stuck_hours: 24,
+            now: now(),
+            page,
+            series_lookup_limit_hit: false,
+        }
+    }
+
+    #[test]
+    fn sab_host_drops_userinfo() {
+        assert_eq!(
+            strip_userinfo("http://u:p@10.0.0.15:8080/sabnzbd"),
+            "http://10.0.0.15:8080/sabnzbd"
+        );
+        assert_eq!(strip_userinfo("u:p@10.0.0.15:8080"), "10.0.0.15:8080");
+        assert_eq!(
+            strip_userinfo("https://10.0.0.15/a@b"),
+            "https://10.0.0.15/a@b"
+        );
+        let r = build(BuildInput {
+            sab_host: "http://u:secret@sab:8080",
+            ..input(&[], &[], Page::default())
+        });
+        assert_eq!(r.sab_host, "http://sab:8080");
+    }
+
     fn snatch(id: &str, comic: &str, issue: &str, at: &str, hash: Option<&str>) -> Snatch {
         Snatch {
             issue_id: Some(id.into()),
@@ -394,16 +458,7 @@ mod tests {
             slot("SABnzbd_nzo_x", "WicDiv.04.nzb", "Completed", 13),
             slot("d", "Saga 005", "Extracting", 14),
         ];
-        let r = build(
-            "m",
-            "http://sab",
-            "comics",
-            &history,
-            &slots,
-            24,
-            now(),
-            Page::default(),
-        );
+        let r = build(input(&history, &slots, Page::default()));
         let by_id = |id: &str| r.rows.iter().find(|r| r.issue_id == id).unwrap();
         assert_eq!(by_id("1").class, "sab_completed");
         assert_eq!(
@@ -441,16 +496,11 @@ mod tests {
     #[test]
     fn recent_snatches_are_skipped() {
         let fresh = now().to_rfc3339().replacen('T', " ", 1)[..19].to_string();
-        let r = build(
-            "m",
-            "h",
-            "comics",
+        let r = build(input(
             &[snatch("1", "Saga", "1", &fresh, None)],
             &[],
-            24,
-            now(),
             Page::default(),
-        );
+        ));
         assert!(r.rows.is_empty());
     }
 
@@ -525,21 +575,16 @@ mod tests {
             offset: 3,
             limit: 10,
         };
-        let r = build("m", "h", "comics", &history, &[], 24, now(), page);
+        let r = build(input(&history, &[], page));
         assert_eq!((r.summary.total, r.rows.len()), (5, 2));
-        let r = build(
-            "m",
-            "h",
-            "comics",
+        let r = build(input(
             &history,
             &[],
-            24,
-            now(),
             Page {
                 offset: 0,
                 limit: 0,
             },
-        );
+        ));
         assert_eq!((r.limit, r.rows.len()), (1, 1));
     }
 }
