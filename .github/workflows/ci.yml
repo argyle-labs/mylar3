@@ -1,7 +1,3 @@
-# ci.yml for a Rust-only plugin: copy to .github/workflows/ci.yml. Each job is
-# one shared job action from argyle-labs/.github; add no steps here. A crate
-# over the default runners' memory cap sets `runs-on: ci-large` (and optionally
-# `build-jobs` / `debuginfo`) on every Rust job.
 name: CI
 
 on:
