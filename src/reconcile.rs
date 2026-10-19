@@ -6,6 +6,8 @@ use crate::sab::{HistorySlot, Sab};
 use crate::status;
 
 pub const DEFAULT_CATEGORY: &str = "comics";
+pub const DEFAULT_LIMIT: usize = 200;
+pub const MAX_LIMIT: usize = 1000;
 const CANDIDATES: usize = 3;
 
 #[orca_struct]
@@ -66,11 +68,20 @@ pub struct ReconcileReport {
     pub sab_category: String,
     /// SAB history entries read for the category.
     pub sab_history_entries: usize,
+    /// Counts over every stuck grab, not just this page.
     pub summary: ReconcileSummary,
+    pub offset: usize,
+    pub limit: usize,
     pub rows: Vec<ReconciledSnatch>,
 }
 
-pub async fn reconcile(name: &str, m: &Mylar, stuck_hours: u32) -> Result<ReconcileReport> {
+pub async fn reconcile(
+    name: &str,
+    m: &Mylar,
+    stuck_hours: u32,
+    offset: usize,
+    limit: usize,
+) -> Result<ReconcileReport> {
     let ini = m.config().await?;
     let (host, key, category) = sab_settings(&ini)?;
     let history = status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
@@ -84,6 +95,7 @@ pub async fn reconcile(name: &str, m: &Mylar, stuck_hours: u32) -> Result<Reconc
         &slots,
         stuck_hours,
         Timestamp::now(),
+        Page { offset, limit },
     ))
 }
 
@@ -101,6 +113,22 @@ fn sab_settings(ini: &ConfigIni) -> Result<(&str, &str, String)> {
     Ok((host, key, category))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Page {
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            limit: DEFAULT_LIMIT,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     name: &str,
     sab_host: &str,
@@ -109,7 +137,9 @@ pub fn build(
     slots: &[HistorySlot],
     stuck_hours: u32,
     now: Timestamp,
+    page: Page,
 ) -> ReconcileReport {
+    let limit = page.limit.clamp(1, MAX_LIMIT);
     let (stuck, grabs) = status::stuck_snatches(history, stuck_hours, now);
     let named: Vec<(Vec<String>, &HistorySlot)> =
         slots.iter().map(|s| (tokens(slot_name(s)), s)).collect();
@@ -129,6 +159,10 @@ pub fn build(
             }
             row
         })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .skip(page.offset)
+        .take(limit)
         .collect();
     ReconcileReport {
         name: name.to_string(),
@@ -137,6 +171,8 @@ pub fn build(
         sab_category: category.to_string(),
         sab_history_entries: slots.len(),
         summary,
+        offset: page.offset,
+        limit,
         rows,
     }
 }
@@ -358,7 +394,16 @@ mod tests {
             slot("SABnzbd_nzo_x", "WicDiv.04.nzb", "Completed", 13),
             slot("d", "Saga 005", "Extracting", 14),
         ];
-        let r = build("m", "http://sab", "comics", &history, &slots, 24, now());
+        let r = build(
+            "m",
+            "http://sab",
+            "comics",
+            &history,
+            &slots,
+            24,
+            now(),
+            Page::default(),
+        );
         let by_id = |id: &str| r.rows.iter().find(|r| r.issue_id == id).unwrap();
         assert_eq!(by_id("1").class, "sab_completed");
         assert_eq!(
@@ -404,6 +449,7 @@ mod tests {
             &[],
             24,
             now(),
+            Page::default(),
         );
         assert!(r.rows.is_empty());
     }
@@ -445,7 +491,7 @@ mod tests {
                 .mount(&sab)
                 .await;
             let m = Mylar::new(&mylar.uri(), "KEY", None);
-            let r = reconcile("m", &m, 24).await.unwrap();
+            let r = reconcile("m", &m, 24, 0, DEFAULT_LIMIT).await.unwrap();
             assert_eq!(r.summary.sab_failed, 1);
             assert_eq!(
                 r.rows[0].sab.as_ref().unwrap().fail_message.as_deref(),
@@ -467,5 +513,33 @@ mod tests {
         );
         let err = sab_settings(&ini).unwrap_err().to_string();
         assert!(err.contains("sab_apikey"), "{err}");
+    }
+
+    #[test]
+    fn rows_page_while_summary_covers_all() {
+        let at = old();
+        let history: Vec<Snatch> = (0..5)
+            .map(|i| snatch(&i.to_string(), "Saga", &i.to_string(), &at, None))
+            .collect();
+        let page = Page {
+            offset: 3,
+            limit: 10,
+        };
+        let r = build("m", "h", "comics", &history, &[], 24, now(), page);
+        assert_eq!((r.summary.total, r.rows.len()), (5, 2));
+        let r = build(
+            "m",
+            "h",
+            "comics",
+            &history,
+            &[],
+            24,
+            now(),
+            Page {
+                offset: 0,
+                limit: 0,
+            },
+        );
+        assert_eq!((r.limit, r.rows.len()), (1, 1));
     }
 }

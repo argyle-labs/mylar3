@@ -27,6 +27,7 @@ const KEYS: &[&str] = &[
 ];
 
 const STUCK_SAMPLE: usize = 10;
+pub const MAX_SERIES_LOOKUPS: usize = 50;
 
 #[orca_struct]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,10 +347,13 @@ pub async fn current(
     stuck_hours: u32,
     now: Timestamp,
 ) -> Result<Vec<Snatch>> {
-    let comics: BTreeSet<String> = stuck_snatches(&history, stuck_hours, now)
+    let mut seen = BTreeSet::new();
+    let comics: Vec<String> = stuck_snatches(&history, stuck_hours, now)
         .0
         .iter()
         .filter_map(|s| s.comic_id.clone())
+        .filter(|id| seen.insert(id.clone()))
+        .take(MAX_SERIES_LOOKUPS)
         .collect();
     let mut moved_on = BTreeSet::new();
     for id in comics {
@@ -740,6 +744,37 @@ mod tests {
             let s = stuck(&kept, 24, now());
             assert_eq!(s.count, 1);
             assert_eq!(s.sample[0].comic, "C2");
+        })
+    }
+
+    #[test]
+    fn series_lookups_are_bounded() {
+        crate::mock::run(async {
+            use crate::mock::matchers::{method, path, query_param};
+            use crate::mock::{Mock, MockServer, ResponseTemplate};
+            use plugin_toolkit::serde_json;
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "getComic"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true, "data": {"comic": [], "issues": [], "annuals": []}
+                })))
+                .mount(&server)
+                .await;
+            let m = Mylar::new(&server.uri(), "KEY", None);
+            let history: Vec<Snatch> = (0..MAX_SERIES_LOOKUPS * 2)
+                .map(|i| Snatch {
+                    comic_id: Some(format!("c{i}")),
+                    ..snatch(&i.to_string(), "2020-01-01 00:00:00", "Snatched")
+                })
+                .collect();
+            let kept = current(&m, history, 24, now()).await.unwrap();
+            assert_eq!(kept.len(), MAX_SERIES_LOOKUPS * 2);
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                MAX_SERIES_LOOKUPS
+            );
         })
     }
 }

@@ -129,6 +129,22 @@ impl ConfigIni {
             .filter(|v| !v.is_empty() && *v != "None")
     }
 
+    pub fn secrets(&self) -> Vec<&str> {
+        self.0
+            .keys()
+            .filter(|k| {
+                let k = k.to_ascii_lowercase();
+                [
+                    "apikey", "api_key", "password", "passkey", "token", "secret",
+                ]
+                .iter()
+                .any(|m| k.contains(m))
+            })
+            .filter_map(|k| self.get(k))
+            .filter(|v| v.len() >= 4)
+            .collect()
+    }
+
     pub fn has(&self, key: &str) -> bool {
         self.0.contains_key(key)
     }
@@ -310,14 +326,15 @@ impl Mylar {
         }
     }
 
-    pub async fn log(&self, search: &str, lines: usize) -> Result<LogPage> {
+    pub async fn log(&self, search: &str, offset: usize, lines: usize) -> Result<LogPage> {
         let what = "mylar /getLog";
+        let offset = offset.to_string();
         let lines = lines.to_string();
         let url = format!(
             "{}/getLog?{}",
             self.base,
             form_encode(&[
-                ("iDisplayStart", "0"),
+                ("iDisplayStart", offset.as_str()),
                 ("iDisplayLength", lines.as_str()),
                 ("iSortCol_0", "0"),
                 ("sSortDir_0", "desc"),
@@ -451,7 +468,15 @@ const LOG_SECRET_MARKERS: &[&str] = &[
     "api_key': '",
     "apikey\": \"",
     "api_key\": \"",
+    "apikey\":\"",
+    "api_key\":\"",
+    "apikey':'",
+    "api_key':'",
     "api_key=",
+    "apikey%3D",
+    "apikey%3d",
+    "api_key%3D",
+    "api_key%3d",
     "password': '",
     "password\": \"",
     "password=",
@@ -672,7 +697,7 @@ mod tests {
                 })))
                 .mount(&server)
                 .await;
-            let page = client(&server).log("", 10).await.unwrap();
+            let page = client(&server).log("", 0, 10).await.unwrap();
             let msg = &page.rows[0].2;
             assert!(
                 !msg.contains("SABSECRET") && !msg.contains("pw1") && !msg.contains("KEY"),

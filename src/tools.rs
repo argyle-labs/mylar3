@@ -77,13 +77,25 @@ pub struct ReconcileArgs {
     #[arg(long, default_value_t = DEFAULT_STUCK_HOURS)]
     #[serde(default = "default_stuck_hours")]
     pub stuck_hours: u32,
+    /// Stuck grabs to skip, oldest first.
+    #[arg(long, default_value_t = 0)]
+    #[serde(default)]
+    pub offset: usize,
+    /// Stuck grabs to return, at most 1000.
+    #[arg(long, default_value_t = reconcile::DEFAULT_LIMIT)]
+    #[serde(default = "default_reconcile_limit")]
+    pub limit: usize,
+}
+
+fn default_reconcile_limit() -> usize {
+    reconcile::DEFAULT_LIMIT
 }
 
 /// Match each stuck Snatched grab to SABnzbd's history (via the SAB host and key Mylar holds) and classify it.
 #[orca_tool(domain = "mylar3", verb = "snatched.reconcile", role = "read")]
 async fn mylar3_snatched_reconcile(args: ReconcileArgs, _ctx: &ToolCtx) -> Result<ReconcileReport> {
     let m = connect(&args.name).await?;
-    reconcile::reconcile(&args.name, &m, args.stuck_hours).await
+    reconcile::reconcile(&args.name, &m, args.stuck_hours, args.offset, args.limit).await
 }
 
 #[orca_struct(args)]
@@ -99,6 +111,10 @@ pub struct LogsArgs {
     #[arg(long, default_value_t = logs::DEFAULT_LINES)]
     #[serde(default = "default_log_lines")]
     pub lines: usize,
+    /// Newest matching lines to skip, for paging back through the log.
+    #[arg(long, default_value_t = 0)]
+    #[serde(default)]
+    pub offset: usize,
 }
 
 fn default_log_lines() -> usize {
@@ -109,7 +125,14 @@ fn default_log_lines() -> usize {
 #[orca_tool(domain = "mylar3", verb = "logs", role = "read")]
 async fn mylar3_logs(args: LogsArgs, _ctx: &ToolCtx) -> Result<LogsReport> {
     let m = connect(&args.name).await?;
-    logs::logs(&args.name, &m, args.grep.as_deref(), args.lines).await
+    logs::logs(
+        &args.name,
+        &m,
+        args.grep.as_deref(),
+        args.offset,
+        args.lines,
+    )
+    .await
 }
 
 #[orca_struct(args)]
