@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use plugin_toolkit::prelude::*;
@@ -27,6 +27,7 @@ const KEYS: &[&str] = &[
 ];
 
 const STUCK_SAMPLE: usize = 10;
+pub const MAX_SERIES_LOOKUPS: usize = 50;
 
 #[orca_struct]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,7 +133,7 @@ pub struct StatusReport {
 pub async fn status(name: &str, m: &Mylar, stuck_hours: u32) -> Result<StatusReport> {
     let series = m.index().await?.len();
     let wanted = m.wanted().await?;
-    let history = m.history().await?;
+    let history = current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
     let config = m.config().await;
     Ok(build(
         name,
@@ -340,7 +341,46 @@ fn utc_as_mylar_local_time(t: Timestamp) -> String {
         .to_string()
 }
 
-pub fn stuck(history: &[Snatch], threshold_hours: u32, now: Timestamp) -> StuckSnatched {
+pub async fn current(
+    m: &Mylar,
+    history: Vec<Snatch>,
+    stuck_hours: u32,
+    now: Timestamp,
+) -> Result<Vec<Snatch>> {
+    let mut seen = BTreeSet::new();
+    let comics: Vec<String> = stuck_snatches(&history, stuck_hours, now)
+        .0
+        .iter()
+        .filter_map(|s| s.comic_id.clone())
+        .filter(|id| seen.insert(id.clone()))
+        .take(MAX_SERIES_LOOKUPS)
+        .collect();
+    let mut moved_on = BTreeSet::new();
+    for id in comics {
+        let c = m.comic(&id).await?;
+        moved_on.extend(
+            c.issues
+                .into_iter()
+                .chain(c.annuals)
+                .filter(|i| i.status.as_deref() != Some("Snatched"))
+                .filter_map(|i| i.id),
+        );
+    }
+    Ok(drop_moved_on(history, &moved_on))
+}
+
+fn drop_moved_on(history: Vec<Snatch>, moved_on: &BTreeSet<String>) -> Vec<Snatch> {
+    history
+        .into_iter()
+        .filter(|s| s.issue_id.as_ref().is_none_or(|id| !moved_on.contains(id)))
+        .collect()
+}
+
+pub fn stuck_snatches(
+    history: &[Snatch],
+    threshold_hours: u32,
+    now: Timestamp,
+) -> (Vec<&Snatch>, BTreeMap<&str, usize>) {
     let before =
         utc_as_mylar_local_time(now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)));
     let mut latest: BTreeMap<&str, &Snatch> = BTreeMap::new();
@@ -365,6 +405,11 @@ pub fn stuck(history: &[Snatch], threshold_hours: u32, now: Timestamp) -> StuckS
         .filter(|s| s.date_added.as_deref().is_some_and(|d| d < before.as_str()))
         .collect();
     stuck.sort_by(|a, b| a.date_added.cmp(&b.date_added));
+    (stuck, grabs)
+}
+
+pub fn stuck(history: &[Snatch], threshold_hours: u32, now: Timestamp) -> StuckSnatched {
+    let (stuck, grabs) = stuck_snatches(history, threshold_hours, now);
     StuckSnatched {
         threshold_hours,
         count: stuck.len(),
@@ -494,6 +539,8 @@ mod tests {
             date_added: Some(at.into()),
             status: Some(status.into()),
             provider: Some("NZBGeek".into()),
+            hash: None,
+            comic_id: Some("c".into()),
         }
     }
 
@@ -665,5 +712,69 @@ mod tests {
         ]);
         let s = build("m", 0, &Wanted::default(), &[], Ok(cfg), 24, now());
         assert_eq!(s.torrents.drift, Some(false));
+    }
+
+    #[test]
+    fn requeued_issues_are_not_stuck() {
+        crate::mock::run(async {
+            use crate::mock::matchers::{method, path, query_param};
+            use crate::mock::{Mock, MockServer, ResponseTemplate};
+            use plugin_toolkit::serde_json;
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "getComic"))
+                .and(query_param("id", "c"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": {"comic": [], "issues": [
+                        {"id": "1", "status": "Wanted"}, {"id": "2", "status": "Snatched"}
+                    ], "annuals": [{"id": "3", "status": "Downloaded"}]}
+                })))
+                .mount(&server)
+                .await;
+            let m = Mylar::new(&server.uri(), "KEY", None);
+            let at = "2020-01-01 00:00:00";
+            let history = vec![
+                snatch("1", at, "Snatched"),
+                snatch("2", at, "Snatched"),
+                snatch("3", at, "Snatched"),
+            ];
+            let kept = current(&m, history, 24, now()).await.unwrap();
+            let s = stuck(&kept, 24, now());
+            assert_eq!(s.count, 1);
+            assert_eq!(s.sample[0].comic, "C2");
+        })
+    }
+
+    #[test]
+    fn series_lookups_are_bounded() {
+        crate::mock::run(async {
+            use crate::mock::matchers::{method, path, query_param};
+            use crate::mock::{Mock, MockServer, ResponseTemplate};
+            use plugin_toolkit::serde_json;
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "getComic"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true, "data": {"comic": [], "issues": [], "annuals": []}
+                })))
+                .mount(&server)
+                .await;
+            let m = Mylar::new(&server.uri(), "KEY", None);
+            let history: Vec<Snatch> = (0..MAX_SERIES_LOOKUPS * 2)
+                .map(|i| Snatch {
+                    comic_id: Some(format!("c{i}")),
+                    ..snatch(&i.to_string(), "2020-01-01 00:00:00", "Snatched")
+                })
+                .collect();
+            let kept = current(&m, history, 24, now()).await.unwrap();
+            assert_eq!(kept.len(), MAX_SERIES_LOOKUPS * 2);
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                MAX_SERIES_LOOKUPS
+            );
+        })
     }
 }

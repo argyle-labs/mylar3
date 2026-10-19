@@ -57,6 +57,28 @@ pub struct Snatch {
     pub status: Option<String>,
     #[serde(rename = "Provider", default)]
     pub provider: Option<String>,
+    #[serde(rename = "Hash", default)]
+    pub hash: Option<String>,
+    #[serde(rename = "ComicID", default)]
+    pub comic_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct IssueState {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct ComicIssues {
+    #[serde(default)]
+    pub issues: Vec<IssueState>,
+    #[serde(default)]
+    pub annuals: Vec<IssueState>,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +103,21 @@ struct ConfigTable {
     rows: Vec<(String, String)>,
 }
 
+#[derive(Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+struct LogTable {
+    #[serde(rename = "iTotalDisplayRecords", default)]
+    matched: usize,
+    #[serde(rename = "aaData")]
+    rows: Vec<(String, String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogPage {
+    pub matched: usize,
+    pub rows: Vec<(String, String, String)>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ConfigIni(pub BTreeMap<String, String>);
 
@@ -90,6 +127,22 @@ impl ConfigIni {
             .get(key)
             .map(|v| v.trim())
             .filter(|v| !v.is_empty() && *v != "None")
+    }
+
+    pub fn secrets(&self) -> Vec<&str> {
+        self.0
+            .keys()
+            .filter(|k| {
+                let k = k.to_ascii_lowercase();
+                [
+                    "apikey", "api_key", "password", "passkey", "token", "secret",
+                ]
+                .iter()
+                .any(|m| k.contains(m))
+            })
+            .filter_map(|k| self.get(k))
+            .filter(|v| v.len() >= 4)
+            .collect()
     }
 
     pub fn has(&self, key: &str) -> bool {
@@ -200,6 +253,10 @@ impl Mylar {
         self.api("getHistory", &[]).await
     }
 
+    pub async fn comic(&self, comic_id: &str) -> Result<ComicIssues> {
+        self.api("getComic", &[("id", comic_id)]).await
+    }
+
     pub async fn force_process(&self, folder: &str) -> Result<String> {
         let body = self
             .api_raw(
@@ -269,6 +326,49 @@ impl Mylar {
         }
     }
 
+    pub async fn log(&self, search: &str, offset: usize, lines: usize) -> Result<LogPage> {
+        let what = "mylar /getLog";
+        let offset = offset.to_string();
+        let lines = lines.to_string();
+        let url = format!(
+            "{}/getLog?{}",
+            self.base,
+            form_encode(&[
+                ("iDisplayStart", offset.as_str()),
+                ("iDisplayLength", lines.as_str()),
+                ("iSortCol_0", "0"),
+                ("sSortDir_0", "desc"),
+                ("sSearch", search),
+            ])
+        );
+        let (status, body) = self.send(self.web(self.http.get(url))?, what).await?;
+        if status == 401 {
+            bail!(
+                "mylar /getLog: 401 — the web UI uses basic auth; set the endpoint's \
+                 web_username/web_password"
+            );
+        }
+        match self.success(what, status, body)? {
+            ResponseBody::Json { json } => {
+                let table: LogTable = serde_json::from_value(json)
+                    .map_err(|e| anyhow!("decode mylar /getLog: {e}"))?;
+                Ok(LogPage {
+                    matched: table.matched,
+                    rows: table
+                        .rows
+                        .into_iter()
+                        .map(|(t, l, m)| (t, l, self.redact_log(&m)))
+                        .collect(),
+                })
+            }
+            ResponseBody::Text { .. } => bail!(
+                "mylar /getLog returned HTML (the forms login page): the web UI uses forms \
+                 login (authentication=2), which needs a cookie session the toolkit HTTP \
+                 client cannot establish"
+            ),
+        }
+    }
+
     pub async fn config_update(&self, fields: Vec<(String, String)>) -> Result<()> {
         let what = "mylar /configUpdate";
         let pairs: Vec<(&str, &str)> = fields
@@ -299,6 +399,12 @@ impl Mylar {
 
     fn transport(&self, what: &str, e: &str) -> plugin_toolkit::anyhow::Error {
         anyhow!("{what}: {}", self.redact(e))
+    }
+
+    fn redact_log(&self, msg: &str) -> String {
+        LOG_SECRET_MARKERS
+            .iter()
+            .fold(self.redact(msg), |out, marker| redact_query(&out, marker))
     }
 
     fn redact(&self, msg: &str) -> String {
@@ -357,14 +463,35 @@ fn form_encode(pairs: &[(&str, &str)]) -> String {
         .join("&")
 }
 
-fn redact_query(msg: &str, marker: &str) -> String {
+const LOG_SECRET_MARKERS: &[&str] = &[
+    "apikey': '",
+    "api_key': '",
+    "apikey\": \"",
+    "api_key\": \"",
+    "apikey\":\"",
+    "api_key\":\"",
+    "apikey':'",
+    "api_key':'",
+    "api_key=",
+    "apikey%3D",
+    "apikey%3d",
+    "api_key%3D",
+    "api_key%3d",
+    "password': '",
+    "password\": \"",
+    "password=",
+    "token': '",
+    "token=",
+];
+
+pub(crate) fn redact_query(msg: &str, marker: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
     while let Some(i) = rest.find(marker) {
         let (head, tail) = rest.split_at(i + marker.len());
         out.push_str(head);
         let end = tail
-            .find(|c: char| c == '&' || c == ')' || c == '"' || c.is_whitespace())
+            .find(|c: char| matches!(c, '&' | ')' | '"' | '\'') || c.is_whitespace())
             .unwrap_or(tail.len());
         if end > 0 {
             out.push_str(scrub::REDACTED_TEXT);
@@ -375,7 +502,7 @@ fn redact_query(msg: &str, marker: &str) -> String {
     out
 }
 
-fn clip(s: &str) -> String {
+pub(crate) fn clip(s: &str) -> String {
     let s = s.trim();
     match s.char_indices().nth(200) {
         Some((i, _)) => format!("{}…", &s[..i]),
@@ -555,6 +682,28 @@ mod tests {
             assert!(err.contains("bad key ***") && !err.contains("KEY"), "{err}");
             let err = m.force_process("/d").await.unwrap_err().to_string();
             assert!(!err.contains("KEY"), "{err}");
+        })
+    }
+
+    #[test]
+    fn log_lines_hide_keys_mylar_echoes() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/getLog"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "iTotalDisplayRecords": 1,
+                    "aaData": [["t", "INFO", "sendtosab: {'output': 'json', 'apikey': 'SABSECRET', 'password': 'pw1'} url?apikey=KEY&x=1"]]
+                })))
+                .mount(&server)
+                .await;
+            let page = client(&server).log("", 0, 10).await.unwrap();
+            let msg = &page.rows[0].2;
+            assert!(
+                !msg.contains("SABSECRET") && !msg.contains("pw1") && !msg.contains("KEY"),
+                "{msg}"
+            );
+            assert!(msg.contains("'apikey': '***'"), "{msg}");
         })
     }
 
