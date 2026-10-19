@@ -340,7 +340,11 @@ fn utc_as_mylar_local_time(t: Timestamp) -> String {
         .to_string()
 }
 
-pub fn stuck(history: &[Snatch], threshold_hours: u32, now: Timestamp) -> StuckSnatched {
+pub fn stuck_snatches(
+    history: &[Snatch],
+    threshold_hours: u32,
+    now: Timestamp,
+) -> (Vec<&Snatch>, BTreeMap<&str, usize>) {
     let before =
         utc_as_mylar_local_time(now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)));
     let mut latest: BTreeMap<&str, &Snatch> = BTreeMap::new();
@@ -365,6 +369,11 @@ pub fn stuck(history: &[Snatch], threshold_hours: u32, now: Timestamp) -> StuckS
         .filter(|s| s.date_added.as_deref().is_some_and(|d| d < before.as_str()))
         .collect();
     stuck.sort_by(|a, b| a.date_added.cmp(&b.date_added));
+    (stuck, grabs)
+}
+
+pub fn stuck(history: &[Snatch], threshold_hours: u32, now: Timestamp) -> StuckSnatched {
+    let (stuck, grabs) = stuck_snatches(history, threshold_hours, now);
     StuckSnatched {
         threshold_hours,
         count: stuck.len(),
@@ -494,6 +503,7 @@ mod tests {
             date_added: Some(at.into()),
             status: Some(status.into()),
             provider: Some("NZBGeek".into()),
+            hash: None,
         }
     }
 

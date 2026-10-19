@@ -3,6 +3,8 @@ use plugin_toolkit::prelude::*;
 use crate::acquisition::{ClientProvider, ResolvedDownloadClient};
 use crate::api::Mylar;
 use crate::execute;
+use crate::logs::{self, LogsReport};
+use crate::reconcile::{self, ReconcileReport};
 use crate::remediate::{self, BacklogProcess, ConfigureReport};
 use crate::status::{self, StatusReport};
 
@@ -64,6 +66,50 @@ fn default_stuck_hours() -> u32 {
 async fn mylar3_status(args: StatusArgs, _ctx: &ToolCtx) -> Result<StatusReport> {
     let m = connect(&args.name).await?;
     status::status(&args.name, &m, args.stuck_hours).await
+}
+
+#[orca_struct(args)]
+pub struct ReconcileArgs {
+    /// Registered mylar3 endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Only grabs still at Snatched after this many hours are reconciled.
+    #[arg(long, default_value_t = DEFAULT_STUCK_HOURS)]
+    #[serde(default = "default_stuck_hours")]
+    pub stuck_hours: u32,
+}
+
+/// Match each stuck Snatched grab to SABnzbd's history (via the SAB host and key Mylar holds) and classify it.
+#[orca_tool(domain = "mylar3", verb = "snatched.reconcile", role = "read")]
+async fn mylar3_snatched_reconcile(args: ReconcileArgs, _ctx: &ToolCtx) -> Result<ReconcileReport> {
+    let m = connect(&args.name).await?;
+    reconcile::reconcile(&args.name, &m, args.stuck_hours).await
+}
+
+#[orca_struct(args)]
+pub struct LogsArgs {
+    /// Registered mylar3 endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Case-insensitive substring a line must contain.
+    #[arg(long)]
+    #[serde(default)]
+    pub grep: Option<String>,
+    /// Newest lines to return, at most 2500.
+    #[arg(long, default_value_t = logs::DEFAULT_LINES)]
+    #[serde(default = "default_log_lines")]
+    pub lines: usize,
+}
+
+fn default_log_lines() -> usize {
+    logs::DEFAULT_LINES
+}
+
+/// Tail Mylar's log. Reads the web log table, since the API's getLogs is always empty on v0.11.
+#[orca_tool(domain = "mylar3", verb = "logs", role = "read")]
+async fn mylar3_logs(args: LogsArgs, _ctx: &ToolCtx) -> Result<LogsReport> {
+    let m = connect(&args.name).await?;
+    logs::logs(&args.name, &m, args.grep.as_deref(), args.lines).await
 }
 
 #[orca_struct(args)]
