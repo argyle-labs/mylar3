@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
-use plugin_toolkit::http::{Client as HttpClient, HttpError, ResponseBody};
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::reqwest::header::HeaderValue;
+use plugin_toolkit::reqwest::{Client as HttpClient, RequestBuilder};
 use plugin_toolkit::scrub;
 use plugin_toolkit::serde_json;
 
@@ -119,19 +120,47 @@ impl Mylar {
     }
 
     async fn api_raw(&self, cmd: &str, params: &[(&str, &str)]) -> Result<ResponseBody> {
-        let mut req = self
-            .http
-            .get(format!("{}/api", self.base))
-            .query("apikey", self.api_key.clone())
-            .query("cmd", cmd);
-        for (k, v) in params {
-            req = req.query(*k, *v);
-        }
+        let mut query = vec![("apikey", self.api_key.as_str()), ("cmd", cmd)];
+        query.extend_from_slice(params);
+        let url = format!("{}/api?{}", self.base, form_encode(&query));
+        let what = format!("mylar {cmd}");
+        let (status, body) = self.send(self.http.get(url), &what).await?;
+        self.success(&what, status, body)
+    }
+
+    async fn send(&self, req: RequestBuilder, what: &str) -> Result<(u16, ResponseBody)> {
         let resp = req
+            .header("accept", HeaderValue::from_static("application/json"))
             .send()
             .await
-            .map_err(|e| self.transport(&format!("mylar {cmd}"), e))?;
-        Ok(resp.body)
+            .map_err(|e| self.transport(what, &e.to_string()))?;
+        let status = resp.status().as_u16();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| self.transport(what, &e.to_string()))?;
+        Ok((status, ResponseBody::from_bytes(&bytes)))
+    }
+
+    fn success(&self, what: &str, status: u16, body: ResponseBody) -> Result<ResponseBody> {
+        if !(200..300).contains(&status) {
+            bail!(
+                "{what}: HTTP {status}: {}",
+                clip(&self.redact(&body.text()))
+            );
+        }
+        Ok(body)
+    }
+
+    fn web(&self, req: RequestBuilder) -> Result<RequestBuilder> {
+        let Some((user, pass)) = &self.web_auth else {
+            return Ok(req);
+        };
+        let token = crate::secret::base64_encode(format!("{user}:{pass}").as_bytes());
+        let value = HeaderValue::from_str(&format!("Basic {token}")).map_err(|_| {
+            anyhow!("web_username/web_password hold a character a header cannot carry")
+        })?;
+        Ok(req.header("authorization", value))
     }
 
     async fn api<T: for<'de> Deserialize<'de>>(
@@ -203,21 +232,21 @@ impl Mylar {
     }
 
     pub async fn config(&self) -> Result<ConfigIni> {
-        let resp = self
-            .http
-            .get(self.web_url("getConfig"))
-            .query("iDisplayStart", "0")
-            .query("iDisplayLength", "100000")
-            .send()
-            .await
-            .map_err(|e| match e {
-                HttpError::Status { status: 401, .. } => anyhow!(
-                    "mylar /getConfig: 401 — the web UI uses basic auth; set the endpoint's \
-                     web_username/web_password"
-                ),
-                e => self.transport("mylar /getConfig", e),
-            })?;
-        match resp.body {
+        let what = "mylar /getConfig";
+        let url = format!(
+            "{}/getConfig?{}",
+            self.base,
+            form_encode(&[("iDisplayStart", "0"), ("iDisplayLength", "100000")])
+        );
+        let (status, body) = self.send(self.web(self.http.get(url))?, what).await?;
+        if status == 401 {
+            bail!(
+                "mylar /getConfig: 401 — the web UI uses basic auth; set the endpoint's \
+                 web_username/web_password"
+            );
+        }
+        let body = self.success(what, status, body)?;
+        match body {
             ResponseBody::Json { json } => {
                 let table: ConfigTable = serde_json::from_value(json)
                     .map_err(|e| anyhow!("decode mylar /getConfig: {e}"))?;
@@ -241,14 +270,21 @@ impl Mylar {
     }
 
     pub async fn config_update(&self, fields: Vec<(String, String)>) -> Result<()> {
-        let resp = self
+        let what = "mylar /configUpdate";
+        let pairs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let req = self
             .http
-            .post(self.web_url("configUpdate"))
-            .form(fields)
-            .send()
-            .await
-            .map_err(|e| self.transport("mylar /configUpdate", e))?;
-        match resp.body {
+            .post(format!("{}/configUpdate", self.base))
+            .header(
+                "content-type",
+                HeaderValue::from_static("application/x-www-form-urlencoded"),
+            )
+            .body(form_encode(&pairs));
+        let (status, body) = self.send(self.web(req)?, what).await?;
+        match self.success(what, status, body)? {
             ResponseBody::Text { text } if text.trim().is_empty() => Ok(()),
             ResponseBody::Text { text } => bail!(
                 "mylar /configUpdate: unexpected reply: {}",
@@ -261,8 +297,8 @@ impl Mylar {
         }
     }
 
-    fn transport(&self, what: &str, e: HttpError) -> plugin_toolkit::anyhow::Error {
-        anyhow!("{what}: {}", self.redact(&e.to_string()))
+    fn transport(&self, what: &str, e: &str) -> plugin_toolkit::anyhow::Error {
+        anyhow!("{what}: {}", self.redact(e))
     }
 
     fn redact(&self, msg: &str) -> String {
@@ -282,26 +318,43 @@ impl Mylar {
         }
         redact_query(&out, "apikey=")
     }
+}
 
-    fn web_url(&self, route: &str) -> String {
-        let base = match &self.web_auth {
-            Some((user, pass)) => with_userinfo(&self.base, user, pass),
-            None => self.base.clone(),
-        };
-        format!("{base}/{route}")
+enum ResponseBody {
+    Json { json: serde_json::Value },
+    Text { text: String },
+}
+
+impl ResponseBody {
+    fn from_bytes(b: &[u8]) -> Self {
+        match serde_json::from_slice(b) {
+            Ok(json) if !b.is_empty() => ResponseBody::Json { json },
+            _ => ResponseBody::Text {
+                text: String::from_utf8_lossy(b).into_owned(),
+            },
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
+            ResponseBody::Json { json } => json.to_string(),
+            ResponseBody::Text { text } => text.clone(),
+        }
     }
 }
 
-fn with_userinfo(base: &str, user: &str, pass: &str) -> String {
-    let creds = format!(
-        "{}:{}@",
-        plugin_toolkit::url::encode(user),
-        plugin_toolkit::url::encode(pass)
-    );
-    match base.split_once("://") {
-        Some((scheme, rest)) => format!("{scheme}://{creds}{rest}"),
-        None => format!("{creds}{base}"),
-    }
+fn form_encode(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                plugin_toolkit::url::encode(k),
+                plugin_toolkit::url::encode(v)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn redact_query(msg: &str, marker: &str) -> String {
@@ -333,158 +386,176 @@ fn clip(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use crate::mock::matchers::{header, method, path, query_param};
+    use crate::mock::{Mock, MockServer, ResponseTemplate};
 
     fn client(server: &MockServer) -> Mylar {
         Mylar::new(&format!("{}/", server.uri()), "KEY", None)
     }
 
-    #[tokio::test]
-    async fn index_unwraps_success_envelope() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api"))
-            .and(query_param("apikey", "KEY"))
-            .and(query_param("cmd", "getIndex"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true, "data": [{"id": "1"}, {"id": "2"}]
-            })))
-            .mount(&server)
-            .await;
-        assert_eq!(client(&server).index().await.unwrap().len(), 2);
+    #[test]
+    fn index_unwraps_success_envelope() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("apikey", "KEY"))
+                .and(query_param("cmd", "getIndex"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true, "data": [{"id": "1"}, {"id": "2"}]
+                })))
+                .mount(&server)
+                .await;
+            assert_eq!(client(&server).index().await.unwrap().len(), 2);
+        })
     }
 
-    #[tokio::test]
-    async fn wanted_reads_bare_payload() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api"))
-            .and(query_param("cmd", "getWanted"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "issues": [{"ComicName": "Saga", "Issue_Number": "1",
-                            "ReleaseDate": "2012-03-14", "IssueDate": "2012-05-01"}]
-            })))
-            .mount(&server)
-            .await;
-        let w = client(&server).wanted().await.unwrap();
-        assert_eq!(w.issues.len(), 1);
-        assert_eq!(w.issues[0].release_date.as_deref(), Some("2012-03-14"));
-        assert!(w.annuals.is_empty());
+    #[test]
+    fn wanted_reads_bare_payload() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "getWanted"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issues": [{"ComicName": "Saga", "Issue_Number": "1",
+                                "ReleaseDate": "2012-03-14", "IssueDate": "2012-05-01"}]
+                })))
+                .mount(&server)
+                .await;
+            let w = client(&server).wanted().await.unwrap();
+            assert_eq!(w.issues.len(), 1);
+            assert_eq!(w.issues[0].release_date.as_deref(), Some("2012-03-14"));
+            assert!(w.annuals.is_empty());
+        })
     }
 
-    #[tokio::test]
-    async fn refusal_surfaces_mylar_message() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": false, "error": {"code": 460, "message": "Incorrect API key"}
-            })))
-            .mount(&server)
-            .await;
-        let err = client(&server).history().await.unwrap_err().to_string();
-        assert!(err.contains("Incorrect API key"), "{err}");
+    #[test]
+    fn refusal_surfaces_mylar_message() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": false, "error": {"code": 460, "message": "Incorrect API key"}
+                })))
+                .mount(&server)
+                .await;
+            let err = client(&server).history().await.unwrap_err().to_string();
+            assert!(err.contains("Incorrect API key"), "{err}");
+        })
     }
 
-    #[tokio::test]
-    async fn config_reads_settings_table_with_basic_auth() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/getConfig"))
-            .and(header("authorization", "Basic YWRtaW46cEBzcw=="))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "iTotalDisplayRecords": 2, "iTotalRecords": 2,
-                "aaData": [["usenet_retention", "3500"], ["SAB_HOST", "None"]]
-            })))
-            .mount(&server)
-            .await;
-        let m = Mylar::new(&server.uri(), "KEY", Some(("admin".into(), "p@ss".into())));
-        let ini = m.config().await.unwrap();
-        assert_eq!(ini.int("usenet_retention"), Some(3500));
-        assert!(ini.has("sab_host"));
-        assert_eq!(ini.get("sab_host"), None);
+    #[test]
+    fn config_reads_settings_table_with_basic_auth() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/getConfig"))
+                .and(header("authorization", "Basic YWRtaW46cEBzcw=="))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "iTotalDisplayRecords": 2, "iTotalRecords": 2,
+                    "aaData": [["usenet_retention", "3500"], ["SAB_HOST", "None"]]
+                })))
+                .mount(&server)
+                .await;
+            let m = Mylar::new(&server.uri(), "KEY", Some(("admin".into(), "p@ss".into())));
+            let ini = m.config().await.unwrap();
+            assert_eq!(ini.int("usenet_retention"), Some(3500));
+            assert!(ini.has("sab_host"));
+            assert_eq!(ini.get("sab_host"), None);
+        })
     }
 
-    #[tokio::test]
-    async fn config_names_forms_login() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/getConfig"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("<html>login</html>"))
-            .mount(&server)
-            .await;
-        let err = client(&server).config().await.unwrap_err().to_string();
-        assert!(err.contains("forms login"), "{err}");
+    #[test]
+    fn config_names_forms_login() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/getConfig"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("<html>login</html>"))
+                .mount(&server)
+                .await;
+            let err = client(&server).config().await.unwrap_err().to_string();
+            assert!(err.contains("forms login"), "{err}");
+        })
     }
 
-    #[tokio::test]
-    async fn config_names_basic_auth_on_401() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/getConfig"))
-            .respond_with(ResponseTemplate::new(401))
-            .mount(&server)
-            .await;
-        let err = client(&server).config().await.unwrap_err().to_string();
-        assert!(err.contains("web_username"), "{err}");
+    #[test]
+    fn config_names_basic_auth_on_401() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/getConfig"))
+                .respond_with(ResponseTemplate::new(401))
+                .mount(&server)
+                .await;
+            let err = client(&server).config().await.unwrap_err().to_string();
+            assert!(err.contains("web_username"), "{err}");
+        })
     }
 
-    #[tokio::test]
-    async fn force_process_sends_manual_run_and_checks_ack() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api"))
-            .and(query_param("cmd", "forceProcess"))
-            .and(query_param("nzb_name", "Manual Run"))
-            .and(query_param("nzb_folder", "/downloads/completed/comics"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                "Successfully submitted request for post-processing for Manual Run",
-            ))
-            .mount(&server)
-            .await;
-        let ack = client(&server)
-            .force_process("/downloads/completed/comics")
-            .await
-            .unwrap();
-        assert!(ack.starts_with("Successfully submitted"));
+    #[test]
+    fn force_process_sends_manual_run_and_checks_ack() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "forceProcess"))
+                .and(query_param("nzb_name", "Manual Run"))
+                .and(query_param("nzb_folder", "/downloads/completed/comics"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "Successfully submitted request for post-processing for Manual Run",
+                ))
+                .mount(&server)
+                .await;
+            let ack = client(&server)
+                .force_process("/downloads/completed/comics")
+                .await
+                .unwrap();
+            assert!(ack.starts_with("Successfully submitted"));
+        })
     }
 
-    #[tokio::test]
-    async fn transport_errors_hide_the_api_key_and_web_login() {
-        let m = Mylar::new(
-            "http://127.0.0.1:1",
-            "SECRETKEY123",
-            Some(("admin".into(), "hunter2!".into())),
-        );
-        let err = format!("{:#}", m.index().await.unwrap_err());
-        assert!(!err.contains("SECRETKEY123"), "{err}");
-        let err = format!("{:#}", m.config().await.unwrap_err());
-        assert!(!err.contains("hunter2"), "{err}");
-        let err = format!("{:#}", m.config_update(vec![]).await.unwrap_err());
-        assert!(!err.contains("hunter2"), "{err}");
+    #[test]
+    fn transport_errors_hide_the_api_key_and_web_login() {
+        crate::mock::run(async {
+            let m = Mylar::new(
+                "http://127.0.0.1:1",
+                "SECRETKEY123",
+                Some(("admin".into(), "hunter2!".into())),
+            );
+            let err = format!("{:#}", m.index().await.unwrap_err());
+            assert!(!err.contains("SECRETKEY123"), "{err}");
+            let err = format!("{:#}", m.config().await.unwrap_err());
+            assert!(!err.contains("hunter2"), "{err}");
+            let err = format!("{:#}", m.config_update(vec![]).await.unwrap_err());
+            assert!(!err.contains("hunter2"), "{err}");
+        })
     }
 
-    #[tokio::test]
-    async fn reply_text_is_redacted() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api"))
-            .and(query_param("cmd", "getIndex"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("bad key KEY"))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/api"))
-            .and(query_param("cmd", "forceProcess"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("?apikey=KEY failed"))
-            .mount(&server)
-            .await;
-        let m = client(&server);
-        let err = m.index().await.unwrap_err().to_string();
-        assert!(err.contains("bad key ***") && !err.contains("KEY"), "{err}");
-        let err = m.force_process("/d").await.unwrap_err().to_string();
-        assert!(!err.contains("KEY"), "{err}");
+    #[test]
+    fn reply_text_is_redacted() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "getIndex"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("bad key KEY"))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "forceProcess"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("?apikey=KEY failed"))
+                .mount(&server)
+                .await;
+            let m = client(&server);
+            let err = m.index().await.unwrap_err().to_string();
+            assert!(err.contains("bad key ***") && !err.contains("KEY"), "{err}");
+            let err = m.force_process("/d").await.unwrap_err().to_string();
+            assert!(!err.contains("KEY"), "{err}");
+        })
     }
 
     #[test]
@@ -495,34 +566,38 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn config_refuses_a_key_listed_twice() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/getConfig"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "aaData": [["SAB_HOST", "a"], ["sab_host", "b"]]
-            })))
-            .mount(&server)
-            .await;
-        let err = client(&server).config().await.unwrap_err().to_string();
-        assert!(err.contains("'sab_host' twice"), "{err}");
+    #[test]
+    fn config_refuses_a_key_listed_twice() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/getConfig"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "aaData": [["SAB_HOST", "a"], ["sab_host", "b"]]
+                })))
+                .mount(&server)
+                .await;
+            let err = client(&server).config().await.unwrap_err().to_string();
+            assert!(err.contains("'sab_host' twice"), "{err}");
+        })
     }
 
-    #[tokio::test]
-    async fn config_update_rejects_a_non_empty_reply() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/configUpdate"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("<html>login</html>"))
-            .mount(&server)
-            .await;
-        let err = client(&server)
-            .config_update(vec![("a".into(), "b".into())])
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unexpected reply"), "{err}");
+    #[test]
+    fn config_update_rejects_a_non_empty_reply() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/configUpdate"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("<html>login</html>"))
+                .mount(&server)
+                .await;
+            let err = client(&server)
+                .config_update(vec![("a".into(), "b".into())])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unexpected reply"), "{err}");
+        })
     }
 
     #[test]

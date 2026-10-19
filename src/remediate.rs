@@ -597,9 +597,9 @@ pub async fn process_backlog(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mock::matchers::{method, path, query_param};
+    use crate::mock::{Mock, MockServer, ResponseTemplate};
     use plugin_toolkit::serde_json::{json, Value};
-    use wiremock::matchers::{method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const UPSTREAM_V0110: &str = r#"['enable_https', 'launch_browser', 'backup_on_start', 'keep_html_cache', 'syno_fix', 'auto_update', 'annuals_on', 'api_enabled', 'nzb_startup_search',
 'enforce_perms', 'sab_to_mylar', 'torrent_local', 'torrent_seedbox', 'rtorrent_ssl', 'rtorrent_verify', 'rtorrent_startonload', 'qbittorrent_ignore_ssl',
@@ -766,135 +766,149 @@ mod tests {
         assert_eq!(ours, upstream);
     }
 
-    #[tokio::test]
-    async fn dry_run_plans_retention_and_writes_nothing() {
-        let server = server(&[table(&[])], ok()).await;
-        let r = configure("m", &mylar(&server), None, None, false)
-            .await
-            .unwrap();
-        assert!(r.dry_run && !r.applied && !r.in_sync);
-        assert_eq!(r.changes.len(), 1);
-        assert_eq!(r.changes[0].key, "usenet_retention");
-        assert_eq!(r.changes[0].current.as_deref(), Some("3500"));
-        assert_eq!(r.changes[0].target, "6000");
-        assert_eq!(writes(&server).await, 0);
+    #[test]
+    fn dry_run_plans_retention_and_writes_nothing() {
+        crate::mock::run(async {
+            let server = server(&[table(&[])], ok()).await;
+            let r = configure("m", &mylar(&server), None, None, false)
+                .await
+                .unwrap();
+            assert!(r.dry_run && !r.applied && !r.in_sync);
+            assert_eq!(r.changes.len(), 1);
+            assert_eq!(r.changes[0].key, "usenet_retention");
+            assert_eq!(r.changes[0].current.as_deref(), Some("3500"));
+            assert_eq!(r.changes[0].target, "6000");
+            assert_eq!(writes(&server).await, 0);
+        })
     }
 
-    #[tokio::test]
-    async fn execute_fixes_retention_and_reposts_the_whole_form() {
-        let before = table(&[("keep_html_cache", "True"), ("jd2_enable", "True")]);
-        let after = table(&[
-            ("keep_html_cache", "True"),
-            ("jd2_enable", "True"),
-            ("usenet_retention", "6000"),
-        ]);
-        let server = server(&[before.clone(), before.clone(), after], ok()).await;
-        let r = configure("m", &mylar(&server), None, None, true)
-            .await
-            .unwrap();
-        assert!(r.applied && r.verified && !r.dry_run, "{r:?}");
+    #[test]
+    fn execute_fixes_retention_and_reposts_the_whole_form() {
+        crate::mock::run(async {
+            let before = table(&[("keep_html_cache", "True"), ("jd2_enable", "True")]);
+            let after = table(&[
+                ("keep_html_cache", "True"),
+                ("jd2_enable", "True"),
+                ("usenet_retention", "6000"),
+            ]);
+            let server = server(&[before.clone(), before.clone(), after], ok()).await;
+            let r = configure("m", &mylar(&server), None, None, true)
+                .await
+                .unwrap();
+            assert!(r.applied && r.verified && !r.dry_run, "{r:?}");
 
-        let form = posted_form(&server).await;
-        let get = |k: &str| form.iter().find(|(f, _)| f == k).map(|(_, v)| v.as_str());
-        assert_eq!(get("usenet_retention"), Some("6000"));
-        let current = ini(&before);
-        for key in FORM_CHECKBOXES {
-            assert_eq!(get(key), current.0.get(*key).map(String::as_str), "{key}");
-        }
-        assert_eq!(get("newznab_name1"), Some("NZBGeek"));
-        assert_eq!(get("newznab_uid1"), Some(""));
-        assert_eq!(get("newznab_apikey4"), Some("KEY2"));
-        assert_eq!(get("newznab_uid4"), Some("7030#7020"));
-        assert_eq!(get("newznab_enabled4"), Some("0"));
-        assert_eq!(get("torznab_name6"), Some("Jackett"));
-        assert_eq!(get("torznab_host6"), Some("http://10.0.0.16:9117/api"));
-        assert_eq!(get("torznab_verify6"), Some("0"));
-        assert_eq!(get("torznab_apikey6"), Some("TKEY"));
-        assert_eq!(get("torznab_category6"), Some("7030#8000"));
-        assert_eq!(get("torznab_enabled6"), Some("1"));
-        assert_eq!(get("sab_host"), None);
-        assert_eq!(get("comicvine_api"), None);
+            let form = posted_form(&server).await;
+            let get = |k: &str| form.iter().find(|(f, _)| f == k).map(|(_, v)| v.as_str());
+            assert_eq!(get("usenet_retention"), Some("6000"));
+            let current = ini(&before);
+            for key in FORM_CHECKBOXES {
+                assert_eq!(get(key), current.0.get(*key).map(String::as_str), "{key}");
+            }
+            assert_eq!(get("newznab_name1"), Some("NZBGeek"));
+            assert_eq!(get("newznab_uid1"), Some(""));
+            assert_eq!(get("newznab_apikey4"), Some("KEY2"));
+            assert_eq!(get("newznab_uid4"), Some("7030#7020"));
+            assert_eq!(get("newznab_enabled4"), Some("0"));
+            assert_eq!(get("torznab_name6"), Some("Jackett"));
+            assert_eq!(get("torznab_host6"), Some("http://10.0.0.16:9117/api"));
+            assert_eq!(get("torznab_verify6"), Some("0"));
+            assert_eq!(get("torznab_apikey6"), Some("TKEY"));
+            assert_eq!(get("torznab_category6"), Some("7030#8000"));
+            assert_eq!(get("torznab_enabled6"), Some("1"));
+            assert_eq!(get("sab_host"), None);
+            assert_eq!(get("comicvine_api"), None);
+        })
     }
 
-    #[tokio::test]
-    async fn execute_in_sync_writes_nothing() {
-        let server = server(&[table(&[("usenet_retention", "6000")])], ok()).await;
-        let r = configure("m", &mylar(&server), None, None, true)
-            .await
-            .unwrap();
-        assert!(r.in_sync && !r.dry_run && !r.applied);
-        assert_eq!(writes(&server).await, 0);
+    #[test]
+    fn execute_in_sync_writes_nothing() {
+        crate::mock::run(async {
+            let server = server(&[table(&[("usenet_retention", "6000")])], ok()).await;
+            let r = configure("m", &mylar(&server), None, None, true)
+                .await
+                .unwrap();
+            assert!(r.in_sync && !r.dry_run && !r.applied);
+            assert_eq!(writes(&server).await, 0);
+        })
     }
 
-    #[tokio::test]
-    async fn execute_fails_on_side_effects_with_redacted_diff_and_prior_values() {
-        let before = table(&[]);
-        let after = table(&[
-            ("usenet_retention", "6000"),
-            ("api_enabled", "False"),
-            ("sab_apikey", "LEAKED"),
-            ("gotify_token", "GLEAK"),
-        ]);
-        let server = server(&[before.clone(), before, after], ok()).await;
-        let err = configure("m", &mylar(&server), None, None, true)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("api_enabled: True -> False"), "{err}");
-        assert!(err.contains("api_enabled=True"), "{err}");
-        assert!(
-            err.contains("sab_apikey: <redacted> -> <redacted>"),
-            "{err}"
-        );
-        assert!(err.contains("gotify_token: <redacted>"), "{err}");
-        for secret in ["SABKEY", "LEAKED", "GTOKEN", "GLEAK"] {
-            assert!(!err.contains(secret), "{secret} in {err}");
-        }
+    #[test]
+    fn execute_fails_on_side_effects_with_redacted_diff_and_prior_values() {
+        crate::mock::run(async {
+            let before = table(&[]);
+            let after = table(&[
+                ("usenet_retention", "6000"),
+                ("api_enabled", "False"),
+                ("sab_apikey", "LEAKED"),
+                ("gotify_token", "GLEAK"),
+            ]);
+            let server = server(&[before.clone(), before, after], ok()).await;
+            let err = configure("m", &mylar(&server), None, None, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("api_enabled: True -> False"), "{err}");
+            assert!(err.contains("api_enabled=True"), "{err}");
+            assert!(
+                err.contains("sab_apikey: <redacted> -> <redacted>"),
+                "{err}"
+            );
+            assert!(err.contains("gotify_token: <redacted>"), "{err}");
+            for secret in ["SABKEY", "LEAKED", "GTOKEN", "GLEAK"] {
+                assert!(!err.contains(secret), "{secret} in {err}");
+            }
+        })
     }
 
-    #[tokio::test]
-    async fn execute_errors_when_the_change_does_not_land() {
-        let server = server(&[table(&[])], ok()).await;
-        let err = configure("m", &mylar(&server), None, None, true)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("[usenet_retention] still drift"), "{err}");
-        assert!(
-            !err.contains("[]") && !err.contains("other settings"),
-            "{err}"
-        );
+    #[test]
+    fn execute_errors_when_the_change_does_not_land() {
+        crate::mock::run(async {
+            let server = server(&[table(&[])], ok()).await;
+            let err = configure("m", &mylar(&server), None, None, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("[usenet_retention] still drift"), "{err}");
+            assert!(
+                !err.contains("[]") && !err.contains("other settings"),
+                "{err}"
+            );
+        })
     }
 
-    #[tokio::test]
-    async fn execute_refuses_when_settings_move_after_the_plan() {
-        let before = table(&[]);
-        let moved = table(&[("post_processing", "False")]);
-        let server = server(&[before, moved], ok()).await;
-        let err = configure("m", &mylar(&server), None, None, true)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("changed since the plan"), "{err}");
-        assert!(err.contains("post_processing: True -> False"), "{err}");
-        assert_eq!(writes(&server).await, 0);
+    #[test]
+    fn execute_refuses_when_settings_move_after_the_plan() {
+        crate::mock::run(async {
+            let before = table(&[]);
+            let moved = table(&[("post_processing", "False")]);
+            let server = server(&[before, moved], ok()).await;
+            let err = configure("m", &mylar(&server), None, None, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("changed since the plan"), "{err}");
+            assert!(err.contains("post_processing: True -> False"), "{err}");
+            assert_eq!(writes(&server).await, 0);
+        })
     }
 
-    #[tokio::test]
-    async fn rejected_write_reports_what_moved() {
-        let before = table(&[]);
-        let after = table(&[("enable_rss", "True")]);
-        let server = server(
-            &[before.clone(), before, after],
-            ResponseTemplate::new(200).set_body_string("<html>Traceback</html>"),
-        )
-        .await;
-        let err = configure("m", &mylar(&server), None, None, true)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unexpected reply"), "{err}");
-        assert!(err.contains("enable_rss: False -> True"), "{err}");
+    #[test]
+    fn rejected_write_reports_what_moved() {
+        crate::mock::run(async {
+            let before = table(&[]);
+            let after = table(&[("enable_rss", "True")]);
+            let server = server(
+                &[before.clone(), before, after],
+                ResponseTemplate::new(200).set_body_string("<html>Traceback</html>"),
+            )
+            .await;
+            let err = configure("m", &mylar(&server), None, None, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unexpected reply"), "{err}");
+            assert!(err.contains("enable_rss: False -> True"), "{err}");
+        })
     }
 
     fn qbit() -> ResolvedDownloadClient {
@@ -909,78 +923,84 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn execute_switches_torrent_client_posting_plaintext_and_reporting_redacted() {
-        let base = [
-            ("usenet_retention", "6000"),
-            ("encrypt_passwords", "True"),
-            ("enable_torrents", "True"),
-            ("torrent_downloader", "4"),
-        ];
-        let before = table(&base);
-        let mut after = table(&base);
-        for (k, v) in [
-            ("torrent_downloader", "5"),
-            ("qbittorrent_host", "http://10.0.0.16:8080"),
-            ("qbittorrent_username", "admin"),
-            ("qbittorrent_label", "comics"),
-        ] {
-            set(&mut after, k, v);
-        }
-        let stored = secret::encode("QBPASS").unwrap();
-        set(&mut after, "qbittorrent_password", &stored);
-        let server = server(&[before.clone(), before, after], ok()).await;
-        let r = configure("m", &mylar(&server), None, Some(&qbit()), true)
-            .await
-            .unwrap();
-        assert!(r.applied && r.verified, "{r:?}");
-        let keys: Vec<&str> = r.changes.iter().map(|c| c.key.as_str()).collect();
-        for k in [
-            "torrent_downloader",
-            "qbittorrent_host",
-            "qbittorrent_username",
-            "qbittorrent_password",
-            "qbittorrent_label",
-        ] {
-            assert!(keys.contains(&k), "{k} in {keys:?}");
-        }
-        assert!(!format!("{r:?}").contains("QBPASS"));
-        let posted = posted_form(&server).await;
-        let get = |k: &str| {
-            posted
-                .iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.as_str())
-        };
-        assert_eq!(get("qbittorrent_password"), Some("QBPASS"));
-        assert_eq!(get("torrent_downloader"), Some("5"));
-        assert_eq!(get("enable_torrents"), Some("True"));
+    #[test]
+    fn execute_switches_torrent_client_posting_plaintext_and_reporting_redacted() {
+        crate::mock::run(async {
+            let base = [
+                ("usenet_retention", "6000"),
+                ("encrypt_passwords", "True"),
+                ("enable_torrents", "True"),
+                ("torrent_downloader", "4"),
+            ];
+            let before = table(&base);
+            let mut after = table(&base);
+            for (k, v) in [
+                ("torrent_downloader", "5"),
+                ("qbittorrent_host", "http://10.0.0.16:8080"),
+                ("qbittorrent_username", "admin"),
+                ("qbittorrent_label", "comics"),
+            ] {
+                set(&mut after, k, v);
+            }
+            let stored = secret::encode("QBPASS").unwrap();
+            set(&mut after, "qbittorrent_password", &stored);
+            let server = server(&[before.clone(), before, after], ok()).await;
+            let r = configure("m", &mylar(&server), None, Some(&qbit()), true)
+                .await
+                .unwrap();
+            assert!(r.applied && r.verified, "{r:?}");
+            let keys: Vec<&str> = r.changes.iter().map(|c| c.key.as_str()).collect();
+            for k in [
+                "torrent_downloader",
+                "qbittorrent_host",
+                "qbittorrent_username",
+                "qbittorrent_password",
+                "qbittorrent_label",
+            ] {
+                assert!(keys.contains(&k), "{k} in {keys:?}");
+            }
+            assert!(!format!("{r:?}").contains("QBPASS"));
+            let posted = posted_form(&server).await;
+            let get = |k: &str| {
+                posted
+                    .iter()
+                    .find(|(key, _)| key == k)
+                    .map(|(_, v)| v.as_str())
+            };
+            assert_eq!(get("qbittorrent_password"), Some("QBPASS"));
+            assert_eq!(get("torrent_downloader"), Some("5"));
+            assert_eq!(get("enable_torrents"), Some("True"));
+        })
     }
 
-    #[tokio::test]
-    async fn torrent_client_dry_run_writes_nothing() {
-        let server = server(&[table(&[("usenet_retention", "6000")])], ok()).await;
-        let r = configure("m", &mylar(&server), None, Some(&qbit()), false)
-            .await
-            .unwrap();
-        assert!(r.dry_run && !r.in_sync && !r.applied);
-        assert_eq!(writes(&server).await, 0);
+    #[test]
+    fn torrent_client_dry_run_writes_nothing() {
+        crate::mock::run(async {
+            let server = server(&[table(&[("usenet_retention", "6000")])], ok()).await;
+            let r = configure("m", &mylar(&server), None, Some(&qbit()), false)
+                .await
+                .unwrap();
+            assert!(r.dry_run && !r.in_sync && !r.applied);
+            assert_eq!(writes(&server).await, 0);
+        })
     }
 
-    #[tokio::test]
-    async fn dry_run_reports_a_set_password_as_will_be_set_and_out_of_sync() {
-        let mut rows = landed(&torrent_base(), &qbit());
-        set(&mut rows, "qbittorrent_password", "STORED");
-        let server = server(&[rows], ok()).await;
-        let mut client = qbit();
-        client.password = Some("dry-run-placeholder".into());
-        let r = configure("m", &mylar(&server), None, Some(&client), false)
-            .await
-            .unwrap();
-        let keys: Vec<&str> = r.changes.iter().map(|c| c.key.as_str()).collect();
-        assert_eq!(keys, ["qbittorrent_password"], "{r:?}");
-        assert_eq!(r.changes[0].target, "will be set");
-        assert!(!r.in_sync && r.dry_run);
+    #[test]
+    fn dry_run_reports_a_set_password_as_will_be_set_and_out_of_sync() {
+        crate::mock::run(async {
+            let mut rows = landed(&torrent_base(), &qbit());
+            set(&mut rows, "qbittorrent_password", "STORED");
+            let server = server(&[rows], ok()).await;
+            let mut client = qbit();
+            client.password = Some("dry-run-placeholder".into());
+            let r = configure("m", &mylar(&server), None, Some(&client), false)
+                .await
+                .unwrap();
+            let keys: Vec<&str> = r.changes.iter().map(|c| c.key.as_str()).collect();
+            assert_eq!(keys, ["qbittorrent_password"], "{r:?}");
+            assert_eq!(r.changes[0].target, "will be set");
+            assert!(!r.in_sync && r.dry_run);
+        })
     }
 
     fn landed(
@@ -1019,137 +1039,153 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    #[tokio::test]
-    async fn execute_torrent_without_encrypt_passwords_stores_plaintext() {
-        let before = torrent_base();
-        let after = landed(&before, &qbit());
-        assert_eq!(ini(&after).get("qbittorrent_password"), Some("QBPASS"));
-        let (r, form) = execute_torrent(before, after, &qbit()).await;
-        let r = r.unwrap();
-        assert!(r.applied && r.verified, "{r:?}");
-        assert_eq!(field(&form, "qbittorrent_password"), Some("QBPASS"));
-    }
-
-    #[tokio::test]
-    async fn execute_catches_a_torrent_password_that_does_not_land() {
-        let before = torrent_base();
-        let mut after = landed(&before, &qbit());
-        set(&mut after, "qbittorrent_password", "OTHER");
-        let err = execute_torrent(before, after, &qbit())
-            .await
-            .0
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("qbittorrent_password") && err.contains("still drift"),
-            "{err}"
-        );
-        assert!(!err.contains("QBPASS") && !err.contains("OTHER"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn execute_catches_a_torrent_downloader_that_does_not_land() {
-        let before = torrent_base();
-        let mut after = landed(&before, &qbit());
-        set(&mut after, "torrent_downloader", "4");
-        let err = execute_torrent(before, after, &qbit())
-            .await
-            .0
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("[torrent_downloader] still drift"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn execute_applies_retention_and_torrent_together() {
-        let before = table(&[("torrent_downloader", "4")]);
-        let mut after = landed(&before, &qbit());
-        set(&mut after, "usenet_retention", "6000");
-        let server = server(&[before.clone(), before, after], ok()).await;
-        let r = configure("m", &mylar(&server), None, Some(&qbit()), true)
-            .await
-            .unwrap();
-        assert!(r.applied && r.verified, "{r:?}");
-        let form = posted_form(&server).await;
-        assert_eq!(field(&form, "usenet_retention"), Some("6000"));
-        assert_eq!(field(&form, "torrent_downloader"), Some("5"));
-        assert_eq!(writes(&server).await, 1);
-    }
-
-    #[tokio::test]
-    async fn execute_posts_a_clear_as_empty() {
-        let mut before = torrent_base();
-        set(&mut before, "qbittorrent_folder", "/old");
-        let after = landed(&before, &qbit());
-        let (r, form) = execute_torrent(before, after, &qbit()).await;
-        let r = r.unwrap();
-        assert!(r.applied && r.verified, "{r:?}");
-        assert_eq!(field(&form, "qbittorrent_folder"), Some(""));
-    }
-
-    #[tokio::test]
-    async fn dry_run_report_withholds_the_password() {
-        let server = server(&[torrent_base()], ok()).await;
-        let r = configure("m", &mylar(&server), None, Some(&qbit()), false)
-            .await
-            .unwrap();
-        assert!(r.changes.iter().any(|c| c.key == "qbittorrent_password"));
-        assert!(!format!("{r:?}").contains("QBPASS"));
-    }
-
-    #[tokio::test]
-    async fn execute_configures_every_other_torrent_client() {
-        use acquisition::ClientProvider::*;
-        for (provider, selector, prefix) in [
-            (Deluge, "4", "deluge_"),
-            (Transmission, "3", "transmission_"),
-            (Rtorrent, "2", "rtorrent_"),
-            (Utorrent, "1", "utorrent_"),
-        ] {
-            let client = ResolvedDownloadClient {
-                provider: Some(provider),
-                name: format!("{provider:?}"),
-                url: Some("http://10.0.0.16:8080".into()),
-                username: Some("admin".into()),
-                password: Some("PASS".into()),
-                ..Default::default()
-            };
+    #[test]
+    fn execute_torrent_without_encrypt_passwords_stores_plaintext() {
+        crate::mock::run(async {
             let before = torrent_base();
+            let after = landed(&before, &qbit());
+            assert_eq!(ini(&after).get("qbittorrent_password"), Some("QBPASS"));
+            let (r, form) = execute_torrent(before, after, &qbit()).await;
+            let r = r.unwrap();
+            assert!(r.applied && r.verified, "{r:?}");
+            assert_eq!(field(&form, "qbittorrent_password"), Some("QBPASS"));
+        })
+    }
+
+    #[test]
+    fn execute_catches_a_torrent_password_that_does_not_land() {
+        crate::mock::run(async {
+            let before = torrent_base();
+            let mut after = landed(&before, &qbit());
+            set(&mut after, "qbittorrent_password", "OTHER");
+            let err = execute_torrent(before, after, &qbit())
+                .await
+                .0
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("qbittorrent_password") && err.contains("still drift"),
+                "{err}"
+            );
+            assert!(!err.contains("QBPASS") && !err.contains("OTHER"), "{err}");
+        })
+    }
+
+    #[test]
+    fn execute_catches_a_torrent_downloader_that_does_not_land() {
+        crate::mock::run(async {
+            let before = torrent_base();
+            let mut after = landed(&before, &qbit());
+            set(&mut after, "torrent_downloader", "4");
+            let err = execute_torrent(before, after, &qbit())
+                .await
+                .0
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("[torrent_downloader] still drift"), "{err}");
+        })
+    }
+
+    #[test]
+    fn execute_applies_retention_and_torrent_together() {
+        crate::mock::run(async {
+            let before = table(&[("torrent_downloader", "4")]);
+            let mut after = landed(&before, &qbit());
+            set(&mut after, "usenet_retention", "6000");
+            let server = server(&[before.clone(), before, after], ok()).await;
+            let r = configure("m", &mylar(&server), None, Some(&qbit()), true)
+                .await
+                .unwrap();
+            assert!(r.applied && r.verified, "{r:?}");
+            let form = posted_form(&server).await;
+            assert_eq!(field(&form, "usenet_retention"), Some("6000"));
+            assert_eq!(field(&form, "torrent_downloader"), Some("5"));
+            assert_eq!(writes(&server).await, 1);
+        })
+    }
+
+    #[test]
+    fn execute_posts_a_clear_as_empty() {
+        crate::mock::run(async {
+            let mut before = torrent_base();
+            set(&mut before, "qbittorrent_folder", "/old");
+            let after = landed(&before, &qbit());
+            let (r, form) = execute_torrent(before, after, &qbit()).await;
+            let r = r.unwrap();
+            assert!(r.applied && r.verified, "{r:?}");
+            assert_eq!(field(&form, "qbittorrent_folder"), Some(""));
+        })
+    }
+
+    #[test]
+    fn dry_run_report_withholds_the_password() {
+        crate::mock::run(async {
+            let server = server(&[torrent_base()], ok()).await;
+            let r = configure("m", &mylar(&server), None, Some(&qbit()), false)
+                .await
+                .unwrap();
+            assert!(r.changes.iter().any(|c| c.key == "qbittorrent_password"));
+            assert!(!format!("{r:?}").contains("QBPASS"));
+        })
+    }
+
+    #[test]
+    fn execute_configures_every_other_torrent_client() {
+        crate::mock::run(async {
+            use acquisition::ClientProvider::*;
+            for (provider, selector, prefix) in [
+                (Deluge, "4", "deluge_"),
+                (Transmission, "3", "transmission_"),
+                (Rtorrent, "2", "rtorrent_"),
+                (Utorrent, "1", "utorrent_"),
+            ] {
+                let client = ResolvedDownloadClient {
+                    provider: Some(provider),
+                    name: format!("{provider:?}"),
+                    url: Some("http://10.0.0.16:8080".into()),
+                    username: Some("admin".into()),
+                    password: Some("PASS".into()),
+                    ..Default::default()
+                };
+                let before = torrent_base();
+                let after = landed(&before, &client);
+                let (r, form) = execute_torrent(before, after, &client).await;
+                let r = r.unwrap();
+                assert!(r.applied && r.verified, "{provider:?}: {r:?}");
+                assert_eq!(
+                    field(&form, "torrent_downloader"),
+                    Some(selector),
+                    "{provider:?}"
+                );
+                assert_eq!(field(&form, &format!("{prefix}password")), Some("PASS"));
+                assert_eq!(field(&form, &format!("{prefix}username")), Some("admin"));
+                assert!(!format!("{r:?}").contains("PASS\""), "{provider:?}: {r:?}");
+            }
+        })
+    }
+
+    #[test]
+    fn omitted_username_leaves_stored_credentials_alone() {
+        crate::mock::run(async {
+            let mut before = torrent_base();
+            set(&mut before, "qbittorrent_username", "admin");
+            set(&mut before, "qbittorrent_password", "KEEP");
+            let client = ResolvedDownloadClient {
+                username: None,
+                password: None,
+                ..qbit()
+            };
             let after = landed(&before, &client);
             let (r, form) = execute_torrent(before, after, &client).await;
             let r = r.unwrap();
-            assert!(r.applied && r.verified, "{provider:?}: {r:?}");
-            assert_eq!(
-                field(&form, "torrent_downloader"),
-                Some(selector),
-                "{provider:?}"
-            );
-            assert_eq!(field(&form, &format!("{prefix}password")), Some("PASS"));
-            assert_eq!(field(&form, &format!("{prefix}username")), Some("admin"));
-            assert!(!format!("{r:?}").contains("PASS\""), "{provider:?}: {r:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn omitted_username_leaves_stored_credentials_alone() {
-        let mut before = torrent_base();
-        set(&mut before, "qbittorrent_username", "admin");
-        set(&mut before, "qbittorrent_password", "KEEP");
-        let client = ResolvedDownloadClient {
-            username: None,
-            password: None,
-            ..qbit()
-        };
-        let after = landed(&before, &client);
-        let (r, form) = execute_torrent(before, after, &client).await;
-        let r = r.unwrap();
-        assert!(r.applied && r.verified, "{r:?}");
-        assert!(r
-            .changes
-            .iter()
-            .all(|c| !c.key.ends_with("_username") && !c.key.ends_with("_password")));
-        assert_eq!(field(&form, "qbittorrent_username"), None);
-        assert_eq!(field(&form, "qbittorrent_password"), None);
+            assert!(r.applied && r.verified, "{r:?}");
+            assert!(r
+                .changes
+                .iter()
+                .all(|c| !c.key.ends_with("_username") && !c.key.ends_with("_password")));
+            assert_eq!(field(&form, "qbittorrent_username"), None);
+            assert_eq!(field(&form, "qbittorrent_password"), None);
+        })
     }
 
     #[test]
@@ -1173,13 +1209,15 @@ mod tests {
         assert_eq!(plan(&ini(&rows), None).0[0].target, "6000");
     }
 
-    #[tokio::test]
-    async fn zero_retention_is_rejected() {
-        let server = server(&[table(&[])], ok()).await;
-        assert!(configure("m", &mylar(&server), Some(0), None, false)
-            .await
-            .is_err());
-        assert_eq!(writes(&server).await, 0);
+    #[test]
+    fn zero_retention_is_rejected() {
+        crate::mock::run(async {
+            let server = server(&[table(&[])], ok()).await;
+            assert!(configure("m", &mylar(&server), Some(0), None, false)
+                .await
+                .is_err());
+            assert_eq!(writes(&server).await, 0);
+        })
     }
 
     #[test]
@@ -1356,33 +1394,37 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn backlog_dry_run_shows_the_checked_folder() {
-        let server = server(&[table(&[])], ok()).await;
-        let r = process_backlog(
-            "m",
-            &mylar(&server),
-            "/downloads/complete//./comics/",
-            24,
-            false,
-        )
-        .await
-        .unwrap();
-        assert!(r.dry_run && !r.queued);
-        assert_eq!(r.folder, "/downloads/complete/comics");
-        assert_eq!(r.allowed_by, "sab_directory /downloads/complete");
-        assert_eq!(r.stuck_snatched, 1);
-        assert_eq!(writes(&server).await, 0);
-    }
-
-    #[tokio::test]
-    async fn backlog_execute_queues_manual_run() {
-        let server = server(&[table(&[])], ok()).await;
-        let r = process_backlog("m", &mylar(&server), "/downloads/complete", 24, true)
+    #[test]
+    fn backlog_dry_run_shows_the_checked_folder() {
+        crate::mock::run(async {
+            let server = server(&[table(&[])], ok()).await;
+            let r = process_backlog(
+                "m",
+                &mylar(&server),
+                "/downloads/complete//./comics/",
+                24,
+                false,
+            )
             .await
             .unwrap();
-        assert!(r.queued && !r.dry_run);
-        assert_eq!(writes(&server).await, 1);
+            assert!(r.dry_run && !r.queued);
+            assert_eq!(r.folder, "/downloads/complete/comics");
+            assert_eq!(r.allowed_by, "sab_directory /downloads/complete");
+            assert_eq!(r.stuck_snatched, 1);
+            assert_eq!(writes(&server).await, 0);
+        })
+    }
+
+    #[test]
+    fn backlog_execute_queues_manual_run() {
+        crate::mock::run(async {
+            let server = server(&[table(&[])], ok()).await;
+            let r = process_backlog("m", &mylar(&server), "/downloads/complete", 24, true)
+                .await
+                .unwrap();
+            assert!(r.queued && !r.dry_run);
+            assert_eq!(writes(&server).await, 1);
+        })
     }
 
     #[test]
@@ -1422,12 +1464,14 @@ mod tests {
         assert!(err.contains("destination_dir"), "{err}");
     }
 
-    #[tokio::test]
-    async fn backlog_rejects_before_any_write() {
-        let server = server(&[table(&[])], ok()).await;
-        assert!(process_backlog("m", &mylar(&server), "/comics", 24, true)
-            .await
-            .is_err());
-        assert_eq!(writes(&server).await, 0);
+    #[test]
+    fn backlog_rejects_before_any_write() {
+        crate::mock::run(async {
+            let server = server(&[table(&[])], ok()).await;
+            assert!(process_backlog("m", &mylar(&server), "/comics", 24, true)
+                .await
+                .is_err());
+            assert_eq!(writes(&server).await, 0);
+        })
     }
 }

@@ -1,6 +1,6 @@
 use plugin_toolkit::prelude::*;
-use plugin_toolkit::reqwest::Url;
 use plugin_toolkit::scrub;
+use url::Url;
 
 use crate::api::ConfigIni;
 use crate::remediate::SettingChange;
