@@ -59,6 +59,26 @@ pub struct Snatch {
     pub provider: Option<String>,
     #[serde(rename = "Hash", default)]
     pub hash: Option<String>,
+    #[serde(rename = "ComicID", default)]
+    pub comic_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct IssueState {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct ComicIssues {
+    #[serde(default)]
+    pub issues: Vec<IssueState>,
+    #[serde(default)]
+    pub annuals: Vec<IssueState>,
 }
 
 #[derive(Deserialize)]
@@ -215,6 +235,10 @@ impl Mylar {
 
     pub async fn history(&self) -> Result<Vec<Snatch>> {
         self.api("getHistory", &[]).await
+    }
+
+    pub async fn comic(&self, comic_id: &str) -> Result<ComicIssues> {
+        self.api("getComic", &[("id", comic_id)]).await
     }
 
     pub async fn force_process(&self, folder: &str) -> Result<String> {

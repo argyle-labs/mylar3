@@ -575,7 +575,7 @@ pub async fn process_backlog(
         .await
         .context("read Mylar's settings to check the folder")?;
     let (folder, allowed_by) = check_folder(&ini, folder)?;
-    let history = m.history().await?;
+    let history = status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
     let stuck = status::stuck(&history, stuck_hours, Timestamp::now()).count;
     let mylar_reply = if execute {
         Some(m.force_process(&folder).await?)

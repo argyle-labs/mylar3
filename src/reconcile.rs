@@ -73,7 +73,7 @@ pub struct ReconcileReport {
 pub async fn reconcile(name: &str, m: &Mylar, stuck_hours: u32) -> Result<ReconcileReport> {
     let ini = m.config().await?;
     let (host, key, category) = sab_settings(&ini)?;
-    let history = m.history().await?;
+    let history = status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
     let sab = Sab::new(host, key);
     let slots = sab.history(&category).await?;
     Ok(build(
@@ -282,6 +282,7 @@ mod tests {
             status: Some("Snatched".into()),
             provider: Some("NZBgeek".into()),
             hash: hash.map(str::to_string),
+            comic_id: None,
         }
     }
 
