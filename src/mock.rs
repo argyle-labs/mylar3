@@ -20,6 +20,7 @@ pub fn run<T>(fut: impl Future<Output = T>) -> T {
         }),
         || {
             tokio::runtime::Builder::new_current_thread()
+                .enable_time()
                 .build()
                 .unwrap()
                 .block_on(fut)

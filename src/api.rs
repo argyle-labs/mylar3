@@ -104,6 +104,22 @@ pub struct ArcIssue {
     pub issue_date: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct WantedArcIssue {
+    #[serde(rename = "IssueArcID", default)]
+    pub issue_arc_id: Option<String>,
+    #[serde(rename = "Status", default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct WantedArcs {
+    #[serde(default)]
+    pub story_arcs: Option<Vec<WantedArcIssue>>,
+}
+
 #[derive(Deserialize)]
 #[serde(crate = "plugin_toolkit::serde")]
 struct Envelope<T> {
@@ -270,6 +286,10 @@ impl Mylar {
 
     pub async fn wanted(&self) -> Result<Wanted> {
         self.api("getWanted", &[]).await
+    }
+
+    pub async fn wanted_arcs(&self) -> Result<WantedArcs> {
+        self.api("getWanted", &[("story_arcs", "true")]).await
     }
 
     pub async fn history(&self) -> Result<Vec<Snatch>> {

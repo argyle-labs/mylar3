@@ -22,7 +22,7 @@ getrandom = "0.3"
 url = "2"
 
 [dev-dependencies]
-tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio    = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints.clippy]
 let_underscore_must_use = "deny"
