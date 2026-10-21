@@ -340,7 +340,7 @@ pub struct IssueArgs {
     pub annual: bool,
 }
 
-/// Mark an issue Wanted and request a search for it.
+/// Mark an issue Wanted and request a search for it; a story-arc issue id (`StoryArcID_IssueArcID`) also needs `series` and `issue_number` as listed in the arc.
 #[orca_tool(
     domain = "mylar3",
     verb = "issue.queue",
@@ -361,7 +361,7 @@ async fn mylar3_issue_queue(args: IssueArgs, ctx: &ToolCtx) -> Result<QueueRepor
     issues::queue(&args.name, &m, target).await
 }
 
-/// Fail an issue's Snatched release so Mylar's search skips it; with `failed_auto`, Mylar marks it Wanted and requests a search.
+/// Fail an issue's Snatched release so Mylar's search skips it; the issue stays Failed, and with `failed_auto` Mylar requests a search skipping that release.
 #[orca_tool(
     domain = "mylar3",
     verb = "issue.fail",
