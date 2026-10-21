@@ -361,7 +361,7 @@ async fn mylar3_issue_queue(args: IssueArgs, ctx: &ToolCtx) -> Result<QueueRepor
     issues::queue(&args.name, &m, target).await
 }
 
-/// Fail an issue's Snatched release so Mylar's search skips it; with `failed_auto`, Mylar marks it Wanted and requests a search.
+/// Fail an issue's Snatched release so Mylar's search skips it; with `failed_auto`, Mylar queues a search for another release.
 #[orca_tool(
     domain = "mylar3",
     verb = "issue.fail",

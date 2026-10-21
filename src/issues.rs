@@ -27,11 +27,11 @@ pub struct FailReport {
     pub name: String,
     pub issue_id: String,
     pub comic_id: String,
-    /// Provider of the newest Snatched grab, now on Mylar's failed list.
+    /// Provider of the newest Snatched grab (the release Mylar most likely failed).
     pub provider: Option<String>,
     /// Issue status re-read after the fail.
     pub status_after: Option<String>,
-    /// `failed_auto` is on, so Mylar marked the issue Wanted and requested a search skipping the failed release.
+    /// `failed_auto` is on, so Mylar queued a search that skips the failed release; the status stays Failed.
     pub search_requested: bool,
 }
 
@@ -201,7 +201,7 @@ pub fn newest_snatch<'a>(history: &'a [Snatch], issue_id: &str) -> Option<&'a Sn
 
 pub async fn fail(name: &str, m: &Mylar, target: Resolved) -> Result<FailReport> {
     if target.annual {
-        bail!("failing an annual's release is not supported; Mylar's failed handling resolves issues only");
+        bail!("Mylar's failed handling does not update an annual's status, so the result can't be verified");
     }
     let ini = m
         .config()
@@ -245,7 +245,7 @@ pub async fn fail(name: &str, m: &Mylar, target: Resolved) -> Result<FailReport>
         newest_snatch(&after, &target.issue_id).map(|s| &s.date_added) == Some(&snatch.date_added);
     if status_after.as_deref() == Some("Snatched") && same_grab {
         bail!(
-            "mylar accepted /failed_handling but issue {} is still Snatched by the same grab; \
+            "mylar accepted /failed_handling but issue {} is unchanged; \
              Mylar did not fail it (see mylar3.logs)",
             target.issue_id
         );
@@ -595,7 +595,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("still Snatched by the same grab"), "{err}");
+            assert!(err.contains("is unchanged"), "{err}");
         })
     }
 
