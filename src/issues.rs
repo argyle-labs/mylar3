@@ -21,8 +21,10 @@ pub struct QueueReport {
     pub previous_status: Option<String>,
     /// Mylar marked the issue Wanted and a search was requested.
     pub search_requested: bool,
-    /// Story-arc issue status re-read after queueing.
-    pub status_after: Option<String>,
+    /// Story-arc issue was listed Wanted before queueing.
+    pub was_wanted: bool,
+    /// Story-arc issue is listed Wanted after queueing.
+    pub wanted_after: bool,
 }
 
 #[orca_struct]
@@ -228,17 +230,16 @@ pub fn match_arc_issue<'a>(rows: &'a [ArcIssue], series: &str, number: &str) -> 
         .collect()
 }
 
-async fn arc_status(m: &Mylar, issue_arc_id: &str) -> Result<Option<String>> {
+async fn arc_wanted(m: &Mylar, issue_arc_id: &str) -> Result<bool> {
     let arcs = m.wanted_arcs().await?.story_arcs.ok_or_else(|| {
         anyhow!(
             "mylar's getWanted lists no story arcs, so the queued arc issue cannot be read back; \
              enable upcoming_storyarcs in Mylar"
         )
     })?;
-    Ok(arcs
-        .into_iter()
-        .find(|a| a.issue_arc_id.as_deref() == Some(issue_arc_id))
-        .and_then(|a| a.status))
+    Ok(arcs.iter().any(|a| {
+        a.issue_arc_id.as_deref() == Some(issue_arc_id) && a.status.as_deref() == Some("Wanted")
+    }))
 }
 
 pub fn match_issue<'a>(
@@ -253,7 +254,7 @@ pub fn match_issue<'a>(
 
 pub async fn queue(name: &str, m: &Mylar, target: Resolved) -> Result<QueueReport> {
     if let Some(arc) = &target.story_arc {
-        let previous_status = arc_status(m, &target.issue_id).await?;
+        let was_wanted = arc_wanted(m, &target.issue_id).await?;
         m.queue_arc_issue(
             &target.issue_id,
             &arc.name,
@@ -263,10 +264,12 @@ pub async fn queue(name: &str, m: &Mylar, target: Resolved) -> Result<QueueRepor
         )
         .await
         .map_err(|e| anyhow!("{e:#}; {MAYBE_APPLIED}"))?;
-        let mut status_after = None;
+        let mut wanted_after = false;
         for _ in 0..10 {
-            status_after = arc_status(m, &target.issue_id).await?;
-            if status_after.as_deref() == Some("Wanted") {
+            wanted_after = arc_wanted(m, &target.issue_id)
+                .await
+                .map_err(|e| anyhow!("{e:#}; {MAYBE_APPLIED}"))?;
+            if wanted_after {
                 break;
             }
             plugin_toolkit::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -278,9 +281,10 @@ pub async fn queue(name: &str, m: &Mylar, target: Resolved) -> Result<QueueRepor
             issue_number: target.number,
             annual: false,
             story_arc: Some(arc.name.clone()),
-            search_requested: status_after.as_deref() == Some("Wanted"),
-            previous_status,
-            status_after,
+            previous_status: None,
+            search_requested: wanted_after,
+            was_wanted,
+            wanted_after,
         });
     }
     if let Some(arc_id) = story_arc_id(&target.issue_id) {
@@ -314,7 +318,8 @@ pub async fn queue(name: &str, m: &Mylar, target: Resolved) -> Result<QueueRepor
         story_arc: None,
         previous_status: target.status,
         search_requested: true,
-        status_after: None,
+        was_wanted: false,
+        wanted_after: false,
     })
 }
 
@@ -743,7 +748,34 @@ mod tests {
             .await
             .unwrap();
             let r = queue("m", &m, t).await.unwrap();
-            assert!(!r.search_requested && r.status_after.is_none());
+            assert!(!r.search_requested && !r.was_wanted && !r.wanted_after);
+        })
+    }
+
+    #[test]
+    fn arc_readback_failure_after_queueing_warns_the_write_may_have_applied() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            arc(&server).await;
+            arc_wanted(&server, json!({"issues": [], "story_arcs": []}), 1).await;
+            arc_wanted(&server, json!({"issues": []}), 100).await;
+            Mock::given(method("GET"))
+                .and(path("/queueit"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let m = client(&server);
+            let t = resolve(
+                &m,
+                Some("55688_2753"),
+                Some("Defenders"),
+                Some("152"),
+                false,
+            )
+            .await
+            .unwrap();
+            let err = queue("m", &m, t).await.unwrap_err().to_string();
+            assert!(err.contains("may already have been applied"), "{err}");
         })
     }
 
@@ -813,8 +845,7 @@ mod tests {
             let r = queue("m", &m, t).await.unwrap();
             assert_eq!(r.story_arc.as_deref(), Some("Secret Wars"));
             assert!(r.search_requested && r.comic_id.is_none());
-            assert_eq!(r.previous_status, None);
-            assert_eq!(r.status_after.as_deref(), Some("Wanted"));
+            assert!(!r.was_wanted && r.wanted_after);
             let reqs = server.received_requests().await.unwrap();
             assert!(reqs
                 .iter()
