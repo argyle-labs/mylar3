@@ -207,6 +207,19 @@ pub fn plan(ini: &ConfigIni, usenet_retention: Option<u32>) -> (Vec<SettingChang
     (changes, manual)
 }
 
+pub fn plan_toggles(ini: &ConfigIni, toggles: &[(&str, bool)]) -> Vec<SettingChange> {
+    toggles
+        .iter()
+        .filter(|(key, on)| ini.flag(key) != Some(*on))
+        .map(|(key, on)| SettingChange {
+            key: key.to_string(),
+            current: ini.get(key).map(str::to_string),
+            target: if *on { "True" } else { "False" }.into(),
+            reason: "requested".into(),
+        })
+        .collect()
+}
+
 pub fn plan_torrent(
     ini: &ConfigIni,
     client: &ResolvedDownloadClient,
@@ -392,6 +405,7 @@ pub async fn configure(
     m: &Mylar,
     usenet_retention: Option<u32>,
     torrent: Option<&ResolvedDownloadClient>,
+    toggles: &[(&str, bool)],
     execute: bool,
 ) -> Result<ConfigureReport> {
     if usenet_retention == Some(0) {
@@ -402,6 +416,7 @@ pub async fn configure(
         .await
         .context("read Mylar's settings to plan configure")?;
     let (mut changes, manual) = plan(&before, usenet_retention);
+    changes.extend(plan_toggles(&before, toggles));
     let mut posted = changes.clone();
     if let Some(client) = torrent {
         let (shown, values) = plan_torrent(&before, client)?;
@@ -455,6 +470,7 @@ pub async fn configure(
         .await
         .context("settings were submitted; re-read to verify failed")?;
     let mut drift = plan(&after, usenet_retention).0;
+    drift.extend(plan_toggles(&after, toggles));
     if let Some(client) = torrent {
         drift.extend(plan_torrent(&after, client)?.0);
     }
@@ -770,7 +786,7 @@ mod tests {
     fn dry_run_plans_retention_and_writes_nothing() {
         crate::mock::run(async {
             let server = server(&[table(&[])], ok()).await;
-            let r = configure("m", &mylar(&server), None, None, false)
+            let r = configure("m", &mylar(&server), None, None, &[], false)
                 .await
                 .unwrap();
             assert!(r.dry_run && !r.applied && !r.in_sync);
@@ -792,7 +808,7 @@ mod tests {
                 ("usenet_retention", "6000"),
             ]);
             let server = server(&[before.clone(), before.clone(), after], ok()).await;
-            let r = configure("m", &mylar(&server), None, None, true)
+            let r = configure("m", &mylar(&server), None, None, &[], true)
                 .await
                 .unwrap();
             assert!(r.applied && r.verified && !r.dry_run, "{r:?}");
@@ -824,7 +840,7 @@ mod tests {
     fn execute_in_sync_writes_nothing() {
         crate::mock::run(async {
             let server = server(&[table(&[("usenet_retention", "6000")])], ok()).await;
-            let r = configure("m", &mylar(&server), None, None, true)
+            let r = configure("m", &mylar(&server), None, None, &[], true)
                 .await
                 .unwrap();
             assert!(r.in_sync && !r.dry_run && !r.applied);
@@ -843,7 +859,7 @@ mod tests {
                 ("gotify_token", "GLEAK"),
             ]);
             let server = server(&[before.clone(), before, after], ok()).await;
-            let err = configure("m", &mylar(&server), None, None, true)
+            let err = configure("m", &mylar(&server), None, None, &[], true)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -864,7 +880,7 @@ mod tests {
     fn execute_errors_when_the_change_does_not_land() {
         crate::mock::run(async {
             let server = server(&[table(&[])], ok()).await;
-            let err = configure("m", &mylar(&server), None, None, true)
+            let err = configure("m", &mylar(&server), None, None, &[], true)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -882,7 +898,7 @@ mod tests {
             let before = table(&[]);
             let moved = table(&[("post_processing", "False")]);
             let server = server(&[before, moved], ok()).await;
-            let err = configure("m", &mylar(&server), None, None, true)
+            let err = configure("m", &mylar(&server), None, None, &[], true)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -902,7 +918,7 @@ mod tests {
                 ResponseTemplate::new(200).set_body_string("<html>Traceback</html>"),
             )
             .await;
-            let err = configure("m", &mylar(&server), None, None, true)
+            let err = configure("m", &mylar(&server), None, None, &[], true)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -945,7 +961,7 @@ mod tests {
             let stored = secret::encode("QBPASS").unwrap();
             set(&mut after, "qbittorrent_password", &stored);
             let server = server(&[before.clone(), before, after], ok()).await;
-            let r = configure("m", &mylar(&server), None, Some(&qbit()), true)
+            let r = configure("m", &mylar(&server), None, Some(&qbit()), &[], true)
                 .await
                 .unwrap();
             assert!(r.applied && r.verified, "{r:?}");
@@ -977,7 +993,7 @@ mod tests {
     fn torrent_client_dry_run_writes_nothing() {
         crate::mock::run(async {
             let server = server(&[table(&[("usenet_retention", "6000")])], ok()).await;
-            let r = configure("m", &mylar(&server), None, Some(&qbit()), false)
+            let r = configure("m", &mylar(&server), None, Some(&qbit()), &[], false)
                 .await
                 .unwrap();
             assert!(r.dry_run && !r.in_sync && !r.applied);
@@ -993,7 +1009,7 @@ mod tests {
             let server = server(&[rows], ok()).await;
             let mut client = qbit();
             client.password = Some("dry-run-placeholder".into());
-            let r = configure("m", &mylar(&server), None, Some(&client), false)
+            let r = configure("m", &mylar(&server), None, Some(&client), &[], false)
                 .await
                 .unwrap();
             let keys: Vec<&str> = r.changes.iter().map(|c| c.key.as_str()).collect();
@@ -1024,7 +1040,7 @@ mod tests {
         client: &ResolvedDownloadClient,
     ) -> (Result<ConfigureReport>, Vec<(String, String)>) {
         let server = server(&[before.clone(), before, after], ok()).await;
-        let r = configure("m", &mylar(&server), None, Some(client), true).await;
+        let r = configure("m", &mylar(&server), None, Some(client), &[], true).await;
         let form = if writes(&server).await > 0 {
             posted_form(&server).await
         } else {
@@ -1093,7 +1109,7 @@ mod tests {
             let mut after = landed(&before, &qbit());
             set(&mut after, "usenet_retention", "6000");
             let server = server(&[before.clone(), before, after], ok()).await;
-            let r = configure("m", &mylar(&server), None, Some(&qbit()), true)
+            let r = configure("m", &mylar(&server), None, Some(&qbit()), &[], true)
                 .await
                 .unwrap();
             assert!(r.applied && r.verified, "{r:?}");
@@ -1121,7 +1137,7 @@ mod tests {
     fn dry_run_report_withholds_the_password() {
         crate::mock::run(async {
             let server = server(&[torrent_base()], ok()).await;
-            let r = configure("m", &mylar(&server), None, Some(&qbit()), false)
+            let r = configure("m", &mylar(&server), None, Some(&qbit()), &[], false)
                 .await
                 .unwrap();
             assert!(r.changes.iter().any(|c| c.key == "qbittorrent_password"));
@@ -1213,7 +1229,7 @@ mod tests {
     fn zero_retention_is_rejected() {
         crate::mock::run(async {
             let server = server(&[table(&[])], ok()).await;
-            assert!(configure("m", &mylar(&server), Some(0), None, false)
+            assert!(configure("m", &mylar(&server), Some(0), None, &[], false)
                 .await
                 .is_err());
             assert_eq!(writes(&server).await, 0);
@@ -1473,5 +1489,27 @@ mod tests {
                 .is_err());
             assert_eq!(writes(&server).await, 0);
         })
+    }
+
+    #[test]
+    fn toggles_plan_only_what_differs() {
+        let rows = [
+            ("failed_download_handling", "False"),
+            ("failed_auto", "True"),
+        ];
+        let ini = ConfigIni(
+            rows.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        let c = plan_toggles(
+            &ini,
+            &[("failed_download_handling", true), ("failed_auto", true)],
+        );
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].key, "failed_download_handling");
+        assert_eq!(c[0].current.as_deref(), Some("False"));
+        assert_eq!(c[0].target, "True");
+        assert!(plan_toggles(&ini, &[("failed_auto", true)]).is_empty());
     }
 }

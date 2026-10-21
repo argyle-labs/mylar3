@@ -169,6 +169,14 @@ pub struct ConfigureArgs {
     #[arg(long)]
     #[serde(default)]
     pub torrent_directory: Option<String>,
+    /// Turn Mylar's failed download handling on or off; on, its search skips releases marked failed.
+    #[arg(long)]
+    #[serde(default)]
+    pub failed_download_handling: Option<bool>,
+    /// Turn automatic re-search after a failed download on or off.
+    #[arg(long)]
+    #[serde(default)]
+    pub failed_auto: Option<bool>,
     /// Apply the changes; omitted, only reports what would change.
     #[arg(long)]
     #[serde(default)]
@@ -186,12 +194,20 @@ async fn mylar3_configure(args: ConfigureArgs, ctx: &ToolCtx) -> Result<Configur
     const TOOL: &str = "mylar3.configure";
     execute::require_admin(TOOL, ctx)?;
     let torrent = torrent_client(&args, plugin_toolkit::secrets::get_required)?;
+    let toggles: Vec<(&str, bool)> = [
+        ("failed_download_handling", args.failed_download_handling),
+        ("failed_auto", args.failed_auto),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k, v)))
+    .collect();
     let m = connect(&args.name).await?;
     let mut report = remediate::configure(
         &args.name,
         &m,
         args.usenet_retention,
         torrent.as_ref().map(|(c, _)| c),
+        &toggles,
         args.execute,
     )
     .await?;
@@ -314,13 +330,17 @@ pub struct IssueArgs {
     #[arg(long)]
     #[serde(default)]
     pub series: Option<String>,
-    /// Issue number within `series`, e.g. `12` or `Annual 1`.
+    /// Issue number within `series`, e.g. `12`; for an annual, its number among the annuals.
     #[arg(long)]
     #[serde(default)]
     pub issue_number: Option<String>,
+    /// Address the series' annual numbered `issue_number` instead of the regular issue.
+    #[arg(long)]
+    #[serde(default)]
+    pub annual: bool,
 }
 
-/// Mark an issue Wanted and search for it now (Mylar's queueIssue searches the one issue).
+/// Mark an issue Wanted and request a search for it.
 #[orca_tool(
     domain = "mylar3",
     verb = "issue.queue",
@@ -335,12 +355,13 @@ async fn mylar3_issue_queue(args: IssueArgs, ctx: &ToolCtx) -> Result<QueueRepor
         args.issue_id.as_deref(),
         args.series.as_deref(),
         args.issue_number.as_deref(),
+        args.annual,
     )
     .await?;
     issues::queue(&args.name, &m, target).await
 }
 
-/// Fail an issue's Snatched release so Mylar blocklists it and, with `failed_auto`, grabs a different one.
+/// Fail an issue's Snatched release so Mylar's search skips it; with `failed_auto`, Mylar marks it Wanted and requests a search.
 #[orca_tool(
     domain = "mylar3",
     verb = "issue.fail",
@@ -355,6 +376,7 @@ async fn mylar3_issue_fail(args: IssueArgs, ctx: &ToolCtx) -> Result<FailReport>
         args.issue_id.as_deref(),
         args.series.as_deref(),
         args.issue_number.as_deref(),
+        args.annual,
     )
     .await?;
     issues::fail(&args.name, &m, target).await
@@ -432,6 +454,8 @@ mod tests {
                 torrent_password_secret: None,
                 torrent_category: None,
                 torrent_directory: None,
+                failed_download_handling: None,
+                failed_auto: None,
                 execute: false,
             };
             let err = mylar3_configure(args, &ctx(role))
@@ -465,6 +489,8 @@ mod tests {
             torrent_password_secret: secret.map(str::to_string),
             torrent_category: None,
             torrent_directory: None,
+            failed_download_handling: None,
+            failed_auto: None,
             execute,
         }
     }
@@ -569,6 +595,7 @@ mod tests {
                 issue_id: Some("1".into()),
                 series: None,
                 issue_number: None,
+                annual: false,
             };
             let err = mylar3_issue_queue(args(), &ctx(role))
                 .await

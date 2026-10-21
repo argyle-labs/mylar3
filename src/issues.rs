@@ -5,6 +5,8 @@ use crate::api::{IssueState, Mylar, Series, Snatch, Wanted};
 pub const DEFAULT_LIMIT: usize = 200;
 pub const MAX_LIMIT: usize = 1000;
 
+const MAYBE_APPLIED: &str = "the write may already have been applied; check status before retrying";
+
 #[orca_struct]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueReport {
@@ -12,10 +14,11 @@ pub struct QueueReport {
     pub issue_id: String,
     pub comic_id: Option<String>,
     pub issue_number: Option<String>,
+    pub annual: bool,
     /// Status before queueing; known only when resolved by series.
     pub previous_status: Option<String>,
-    /// Mylar marked the issue Wanted and ran a search for it.
-    pub queued: bool,
+    /// Mylar marked the issue Wanted and a search was requested.
+    pub search_requested: bool,
 }
 
 #[orca_struct]
@@ -24,10 +27,12 @@ pub struct FailReport {
     pub name: String,
     pub issue_id: String,
     pub comic_id: String,
-    /// Provider of the newest Snatched grab, now blocklisted.
+    /// Provider of the newest Snatched grab, now on Mylar's failed list.
     pub provider: Option<String>,
-    /// `failed_auto` is on, so Mylar re-searched skipping the failed release.
-    pub research_queued: bool,
+    /// Issue status re-read after the fail.
+    pub status_after: Option<String>,
+    /// `failed_auto` is on, so Mylar marked the issue Wanted and requested a search skipping the failed release.
+    pub search_requested: bool,
 }
 
 #[orca_struct]
@@ -55,8 +60,10 @@ pub struct WantedReport {
 pub struct Resolved {
     pub issue_id: String,
     pub comic_id: Option<String>,
+    pub series_name: Option<String>,
     pub number: Option<String>,
     pub status: Option<String>,
+    pub annual: bool,
 }
 
 pub async fn resolve(
@@ -64,27 +71,39 @@ pub async fn resolve(
     issue_id: Option<&str>,
     series: Option<&str>,
     number: Option<&str>,
+    annual: bool,
 ) -> Result<Resolved> {
     match (issue_id.filter(|s| !s.is_empty()), series, number) {
+        (Some(_), None, None) if annual => {
+            bail!("an annual is addressed by series and issue_number; Mylar queues annuals by ComicID")
+        }
         (Some(id), None, None) => Ok(Resolved {
             issue_id: id.to_string(),
             comic_id: None,
+            series_name: None,
             number: None,
             status: None,
+            annual: false,
         }),
         (None, Some(series), Some(number)) => {
             let comic_id = match_series(&m.index().await?, series)?;
             let comic = m.comic(&comic_id).await?;
-            let issue = match_issue(comic.issues.iter().chain(&comic.annuals), number)
-                .ok_or_else(|| anyhow!("series {comic_id} has no issue numbered '{number}'"))?;
+            let (list, kind) = match annual {
+                true => (&comic.annuals, "annual"),
+                false => (&comic.issues, "issue"),
+            };
+            let issue = match_issue(list, number)
+                .ok_or_else(|| anyhow!("series {comic_id} has no {kind} numbered '{number}'"))?;
             Ok(Resolved {
                 issue_id: issue
                     .id
                     .clone()
-                    .ok_or_else(|| anyhow!("mylar listed issue '{number}' without an id"))?,
+                    .ok_or_else(|| anyhow!("mylar listed {kind} '{number}' without an id"))?,
+                series_name: comic.comic.first().and_then(|c| c.name.clone()),
                 comic_id: Some(comic_id),
                 number: issue.number.clone(),
                 status: issue.status.clone(),
+                annual,
             })
         }
         _ => bail!("give either issue_id, or series and issue_number"),
@@ -147,14 +166,28 @@ pub fn match_issue<'a>(
 }
 
 pub async fn queue(name: &str, m: &Mylar, target: Resolved) -> Result<QueueReport> {
-    m.queue_issue(&target.issue_id).await?;
+    let sent = match (&target.annual, &target.comic_id, &target.number) {
+        (true, Some(comic_id), Some(number)) => {
+            m.queue_annual(
+                comic_id,
+                &target.issue_id,
+                number,
+                target.series_name.as_deref(),
+            )
+            .await
+        }
+        (true, _, _) => bail!("an annual needs its ComicID and number to queue"),
+        (false, _, _) => m.queue_issue(&target.issue_id).await,
+    };
+    sent.map_err(|e| anyhow!("{e:#}; {MAYBE_APPLIED}"))?;
     Ok(QueueReport {
         name: name.to_string(),
         issue_id: target.issue_id,
         comic_id: target.comic_id,
         issue_number: target.number,
+        annual: target.annual,
         previous_status: target.status,
-        queued: true,
+        search_requested: true,
     })
 }
 
@@ -167,6 +200,9 @@ pub fn newest_snatch<'a>(history: &'a [Snatch], issue_id: &str) -> Option<&'a Sn
 }
 
 pub async fn fail(name: &str, m: &Mylar, target: Resolved) -> Result<FailReport> {
+    if target.annual {
+        bail!("failing an annual's release is not supported; Mylar's failed handling resolves issues only");
+    }
     let ini = m
         .config()
         .await
@@ -174,7 +210,7 @@ pub async fn fail(name: &str, m: &Mylar, target: Resolved) -> Result<FailReport>
     if ini.flag("failed_download_handling") != Some(true) {
         bail!(
             "mylar has failed_download_handling off, so its search ignores the failed list; \
-             enable it before failing a release"
+             enable it (mylar3.configure --failed-download-handling true) before failing a release"
         );
     }
     let history = m.history().await?;
@@ -195,13 +231,32 @@ pub async fn fail(name: &str, m: &Mylar, target: Resolved) -> Result<FailReport>
                 target.issue_id
             )
         })?;
-    m.failed_handling(&comic_id, &target.issue_id).await?;
+    m.failed_handling(&comic_id, &target.issue_id)
+        .await
+        .map_err(|e| anyhow!("{e:#}; {MAYBE_APPLIED}"))?;
+    let comic = m.comic(&comic_id).await?;
+    let status_after = comic
+        .issues
+        .iter()
+        .find(|i| i.id.as_deref() == Some(target.issue_id.as_str()))
+        .and_then(|i| i.status.clone());
+    let after = m.history().await?;
+    let same_grab =
+        newest_snatch(&after, &target.issue_id).map(|s| &s.date_added) == Some(&snatch.date_added);
+    if status_after.as_deref() == Some("Snatched") && same_grab {
+        bail!(
+            "mylar accepted /failed_handling but issue {} is still Snatched by the same grab; \
+             Mylar did not fail it (see mylar3.logs)",
+            target.issue_id
+        );
+    }
     Ok(FailReport {
         name: name.to_string(),
         issue_id: target.issue_id,
         comic_id,
         provider: snatch.provider.clone(),
-        research_queued: ini.flag("failed_auto") == Some(true),
+        status_after,
+        search_requested: ini.flag("failed_auto") == Some(true),
     })
 }
 
@@ -271,12 +326,12 @@ mod tests {
             .and(query_param("id", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true, "data": {
-                    "comic": [{"id": "100"}],
+                    "comic": [{"id": "100", "name": "Saga"}],
                     "issues": [
                         {"id": "9001", "number": "1", "status": "Skipped"},
                         {"id": "9012", "number": "12", "status": "Snatched"}
                     ],
-                    "annuals": [{"id": "9100", "number": "Annual 1", "status": "Wanted"}]
+                    "annuals": [{"id": "9100", "number": "1", "status": "Skipped"}]
                 }
             })))
             .mount(server)
@@ -336,11 +391,17 @@ mod tests {
                 (None, Some("Saga"), None),
                 (None, None, None),
             ] {
-                let err = resolve(&m, id, s, n).await.unwrap_err().to_string();
+                let err = resolve(&m, id, s, n, false).await.unwrap_err().to_string();
                 assert!(err.contains("either issue_id"), "{err}");
             }
-            let r = resolve(&m, Some("42"), None, None).await.unwrap();
+            let r = resolve(&m, Some("42"), None, None, false).await.unwrap();
             assert_eq!(r.issue_id, "42");
+            assert!(!r.annual);
+            let err = resolve(&m, Some("42"), None, None, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("series and issue_number"), "{err}");
         })
     }
 
@@ -350,20 +411,33 @@ mod tests {
             let server = MockServer::start().await;
             watchlist(&server).await;
             let m = client(&server);
-            let r = resolve(&m, None, Some("Saga"), Some("012")).await.unwrap();
+            let r = resolve(&m, None, Some("Saga"), Some("012"), false)
+                .await
+                .unwrap();
             assert_eq!(r.issue_id, "9012");
             assert_eq!(r.comic_id.as_deref(), Some("100"));
             assert_eq!(r.status.as_deref(), Some("Snatched"));
-            let r = resolve(&m, None, Some("100"), Some("annual 1"))
+            let r = resolve(&m, None, Some("Saga"), Some("1"), false)
+                .await
+                .unwrap();
+            assert_eq!(r.issue_id, "9001");
+            let r = resolve(&m, None, Some("100"), Some("1"), true)
                 .await
                 .unwrap();
             assert_eq!(r.issue_id, "9100");
-            let err = resolve(&m, None, Some("Saga"), Some("99"))
+            assert!(r.annual);
+            assert_eq!(r.series_name.as_deref(), Some("Saga"));
+            let err = resolve(&m, None, Some("Saga"), Some("12"), true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no annual numbered '12'"), "{err}");
+            let err = resolve(&m, None, Some("Saga"), Some("99"), false)
                 .await
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("no issue numbered '99'"), "{err}");
-            let err = resolve(&m, None, Some("Paper Girls"), Some("1"))
+            let err = resolve(&m, None, Some("Paper Girls"), Some("1"), false)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -387,12 +461,52 @@ mod tests {
             let target = Resolved {
                 issue_id: "9001".into(),
                 comic_id: Some("100".into()),
+                series_name: Some("Saga".into()),
                 number: Some("1".into()),
                 status: Some("Skipped".into()),
+                annual: false,
             };
             let r = queue("m", &m, target).await.unwrap();
-            assert!(r.queued);
+            assert!(r.search_requested);
             assert_eq!(r.previous_status.as_deref(), Some("Skipped"));
+        })
+    }
+
+    #[test]
+    fn queue_annual_uses_the_web_want_ann_route() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/queueit"))
+                .and(query_param("mode", "want_ann"))
+                .and(query_param("ComicID", "100"))
+                .and(query_param("IssueID", "9100"))
+                .and(query_param("ComicIssue", "1"))
+                .and(query_param("ComicName", "Saga"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let target = Resolved {
+                issue_id: "9100".into(),
+                comic_id: Some("100".into()),
+                series_name: Some("Saga".into()),
+                number: Some("1".into()),
+                status: Some("Skipped".into()),
+                annual: true,
+            };
+            let r = queue("m", &client(&server), target).await.unwrap();
+            assert!(r.annual && r.search_requested);
+            let reqs = server.received_requests().await.unwrap();
+            assert!(reqs.iter().all(|r| r.url.path() != "/api"));
+        })
+    }
+
+    #[test]
+    fn queue_transport_error_warns_the_write_may_have_applied() {
+        crate::mock::run(async {
+            let m = Mylar::new("http://127.0.0.1:1", "KEY", None);
+            let err = queue("m", &m, target("1")).await.unwrap_err().to_string();
+            assert!(err.contains("may already have been applied"), "{err}");
         })
     }
 
@@ -429,9 +543,71 @@ mod tests {
         Resolved {
             issue_id: id.into(),
             comic_id: None,
+            series_name: None,
             number: None,
             status: None,
+            annual: false,
         }
+    }
+
+    async fn snatched_twice(server: &MockServer) {
+        api(
+            server,
+            "getHistory",
+            json!({"success": true, "data": [
+                {"IssueID": "9012", "ComicID": "100", "Status": "Snatched",
+                 "Provider": "old", "DateAdded": "2026-10-01 10:00:00"},
+                {"IssueID": "9012", "ComicID": "100", "Status": "Snatched",
+                 "Provider": "nzbgeek", "DateAdded": "2026-10-02 10:00:00"}
+            ]}),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/failed_handling"))
+            .and(query_param("ComicID", "100"))
+            .and(query_param("IssueID", "9012"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    async fn issue_status(server: &MockServer, status: &str) {
+        api(
+            server,
+            "getComic",
+            json!({"success": true, "data": {
+                "comic": [{"id": "100", "name": "Saga"}],
+                "issues": [{"id": "9012", "number": "12", "status": status}],
+                "annuals": []
+            }}),
+        )
+        .await;
+    }
+
+    #[test]
+    fn fail_errors_when_the_issue_is_unchanged() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            config(&server, "True", "True").await;
+            snatched_twice(&server).await;
+            issue_status(&server, "Snatched").await;
+            let err = fail("m", &client(&server), target("9012"))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("still Snatched by the same grab"), "{err}");
+        })
+    }
+
+    #[test]
+    fn fail_refuses_annuals() {
+        crate::mock::run(async {
+            let m = Mylar::new("http://127.0.0.1:1", "KEY", None);
+            let mut t = target("9100");
+            t.annual = true;
+            let err = fail("m", &m, t).await.unwrap_err().to_string();
+            assert!(err.contains("annual"), "{err}");
+        })
     }
 
     #[test]
@@ -439,28 +615,13 @@ mod tests {
         crate::mock::run(async {
             let server = MockServer::start().await;
             config(&server, "True", "True").await;
-            api(
-                &server,
-                "getHistory",
-                json!({"success": true, "data": [
-                    {"IssueID": "9012", "ComicID": "100", "Status": "Snatched",
-                     "Provider": "old", "DateAdded": "2026-10-01 10:00:00"},
-                    {"IssueID": "9012", "ComicID": "100", "Status": "Snatched",
-                     "Provider": "nzbgeek", "DateAdded": "2026-10-02 10:00:00"}
-                ]}),
-            )
-            .await;
-            Mock::given(method("GET"))
-                .and(path("/failed_handling"))
-                .and(query_param("ComicID", "100"))
-                .and(query_param("IssueID", "9012"))
-                .respond_with(ResponseTemplate::new(200))
-                .mount(&server)
-                .await;
+            snatched_twice(&server).await;
+            issue_status(&server, "Failed").await;
             let r = fail("m", &client(&server), target("9012")).await.unwrap();
             assert_eq!(r.comic_id, "100");
             assert_eq!(r.provider.as_deref(), Some("nzbgeek"));
-            assert!(r.research_queued);
+            assert_eq!(r.status_after.as_deref(), Some("Failed"));
+            assert!(r.search_requested);
         })
     }
 
