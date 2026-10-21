@@ -91,6 +91,19 @@ pub struct ComicIssues {
     pub annuals: Vec<IssueState>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct ArcIssue {
+    #[serde(rename = "StoryArc", default)]
+    pub story_arc: Option<String>,
+    #[serde(rename = "ComicName", default)]
+    pub comic_name: Option<String>,
+    #[serde(rename = "IssueNumber", default)]
+    pub issue_number: Option<String>,
+    #[serde(rename = "IssueDate", default)]
+    pub issue_date: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(crate = "plugin_toolkit::serde")]
 struct Envelope<T> {
@@ -267,6 +280,10 @@ impl Mylar {
         self.api("getComic", &[("id", comic_id)]).await
     }
 
+    pub async fn story_arc(&self, story_arc_id: &str) -> Result<Vec<ArcIssue>> {
+        self.api("getStoryArc", &[("id", story_arc_id)]).await
+    }
+
     pub async fn force_process(&self, folder: &str) -> Result<String> {
         let body = self
             .api_raw(
@@ -339,6 +356,28 @@ impl Mylar {
             query.push(("ComicName", n));
         }
         self.web_get_empty("/queueit", &query).await
+    }
+
+    pub async fn queue_arc_issue(
+        &self,
+        issue_arc_id: &str,
+        story_arc: &str,
+        comic_name: &str,
+        number: &str,
+        year: &str,
+    ) -> Result<()> {
+        self.web_get_empty(
+            "/queueit",
+            &[
+                ("mode", "readlist"),
+                ("IssueArcID", issue_arc_id),
+                ("SARC", story_arc),
+                ("ComicName", comic_name),
+                ("ComicIssue", number),
+                ("ComicYear", year),
+            ],
+        )
+        .await
     }
 
     pub async fn failed_handling(&self, comic_id: &str, issue_id: &str) -> Result<()> {

@@ -1,6 +1,6 @@
 use plugin_toolkit::prelude::*;
 
-use crate::api::{IssueState, Mylar, Series, Snatch, Wanted};
+use crate::api::{ArcIssue, IssueState, Mylar, Series, Snatch, Wanted};
 
 pub const DEFAULT_LIMIT: usize = 200;
 pub const MAX_LIMIT: usize = 1000;
@@ -15,6 +15,8 @@ pub struct QueueReport {
     pub comic_id: Option<String>,
     pub issue_number: Option<String>,
     pub annual: bool,
+    /// Story arc the issue was queued through, for a reading-list issue off the watchlist.
+    pub story_arc: Option<String>,
     /// Status before queueing; known only when resolved by series.
     pub previous_status: Option<String>,
     /// Mylar marked the issue Wanted and a search was requested.
@@ -31,7 +33,7 @@ pub struct FailReport {
     pub provider: Option<String>,
     /// Issue status re-read after the fail.
     pub status_after: Option<String>,
-    /// `failed_auto` is on, so Mylar marked the issue Wanted and requested a search skipping the failed release.
+    /// `failed_auto` is on, so Mylar requested a search skipping the failed release.
     pub search_requested: bool,
 }
 
@@ -64,6 +66,20 @@ pub struct Resolved {
     pub number: Option<String>,
     pub status: Option<String>,
     pub annual: bool,
+    pub story_arc: Option<ArcTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArcTarget {
+    pub name: String,
+    pub year: String,
+}
+
+pub fn story_arc_id(issue_id: &str) -> Option<&str> {
+    match issue_id.split_once('_') {
+        Some((arc, rest)) if !arc.is_empty() && !rest.is_empty() => Some(arc),
+        _ => None,
+    }
 }
 
 pub async fn resolve(
@@ -84,7 +100,34 @@ pub async fn resolve(
             number: None,
             status: None,
             annual: false,
+            story_arc: None,
         }),
+        (Some(id), Some(series), Some(number)) if !annual && story_arc_id(id).is_some() => {
+            let arc_id = story_arc_id(id).unwrap_or_default();
+            let rows = m.story_arc(arc_id).await?;
+            let row = match_arc_issue(&rows, series, number)
+                .ok_or_else(|| anyhow!("story arc {arc_id} has no issue '{series}' #{number}"))?;
+            Ok(Resolved {
+                issue_id: id.to_string(),
+                comic_id: None,
+                series_name: row.comic_name.clone(),
+                number: row.issue_number.clone(),
+                status: None,
+                annual: false,
+                story_arc: Some(ArcTarget {
+                    name: row
+                        .story_arc
+                        .clone()
+                        .ok_or_else(|| anyhow!("mylar listed story arc {arc_id} without a name"))?,
+                    year: row
+                        .issue_date
+                        .as_deref()
+                        .and_then(|d| d.get(..4))
+                        .unwrap_or_default()
+                        .to_string(),
+                }),
+            })
+        }
         (None, Some(series), Some(number)) => {
             let comic_id = match_series(&m.index().await?, series)?;
             let comic = m.comic(&comic_id).await?;
@@ -104,6 +147,7 @@ pub async fn resolve(
                 number: issue.number.clone(),
                 status: issue.status.clone(),
                 annual,
+                story_arc: None,
             })
         }
         _ => bail!("give either issue_id, or series and issue_number"),
@@ -155,6 +199,20 @@ fn normalize(n: &str) -> String {
     }
 }
 
+pub fn match_arc_issue<'a>(
+    rows: &'a [ArcIssue],
+    series: &str,
+    number: &str,
+) -> Option<&'a ArcIssue> {
+    let want = normalize(number);
+    rows.iter().find(|r| {
+        r.comic_name
+            .as_deref()
+            .is_some_and(|n| n.trim().eq_ignore_ascii_case(series.trim()))
+            && r.issue_number.as_deref().map(normalize) == Some(want.clone())
+    })
+}
+
 pub fn match_issue<'a>(
     issues: impl IntoIterator<Item = &'a IssueState>,
     number: &str,
@@ -166,6 +224,35 @@ pub fn match_issue<'a>(
 }
 
 pub async fn queue(name: &str, m: &Mylar, target: Resolved) -> Result<QueueReport> {
+    if let Some(arc) = &target.story_arc {
+        m.queue_arc_issue(
+            &target.issue_id,
+            &arc.name,
+            target.series_name.as_deref().unwrap_or_default(),
+            target.number.as_deref().unwrap_or_default(),
+            &arc.year,
+        )
+        .await
+        .map_err(|e| anyhow!("{e:#}; {MAYBE_APPLIED}"))?;
+        return Ok(QueueReport {
+            name: name.to_string(),
+            issue_id: target.issue_id,
+            comic_id: None,
+            issue_number: target.number,
+            annual: false,
+            story_arc: Some(arc.name.clone()),
+            previous_status: None,
+            search_requested: true,
+        });
+    }
+    if let Some(arc_id) = story_arc_id(&target.issue_id) {
+        bail!(
+            "{} is a story-arc issue id (arc {arc_id}); Mylar's queueIssue would write it into the \
+             watchlist issues table, so pass series and issue_number as listed in the arc to queue \
+             it through the story-arc route",
+            target.issue_id
+        );
+    }
     let sent = match (&target.annual, &target.comic_id, &target.number) {
         (true, Some(comic_id), Some(number)) => {
             m.queue_annual(
@@ -186,6 +273,7 @@ pub async fn queue(name: &str, m: &Mylar, target: Resolved) -> Result<QueueRepor
         comic_id: target.comic_id,
         issue_number: target.number,
         annual: target.annual,
+        story_arc: None,
         previous_status: target.status,
         search_requested: true,
     })
@@ -200,6 +288,12 @@ pub fn newest_snatch<'a>(history: &'a [Snatch], issue_id: &str) -> Option<&'a Sn
 }
 
 pub async fn fail(name: &str, m: &Mylar, target: Resolved) -> Result<FailReport> {
+    if story_arc_id(&target.issue_id).is_some() {
+        bail!(
+            "{} is a story-arc issue id; Mylar's failed handling resolves watchlist issues only",
+            target.issue_id
+        );
+    }
     if target.annual {
         bail!("failing an annual's release is not supported; Mylar's failed handling resolves issues only");
     }
@@ -465,6 +559,7 @@ mod tests {
                 number: Some("1".into()),
                 status: Some("Skipped".into()),
                 annual: false,
+                story_arc: None,
             };
             let r = queue("m", &m, target).await.unwrap();
             assert!(r.search_requested);
@@ -493,11 +588,98 @@ mod tests {
                 number: Some("1".into()),
                 status: Some("Skipped".into()),
                 annual: true,
+                story_arc: None,
             };
             let r = queue("m", &client(&server), target).await.unwrap();
             assert!(r.annual && r.search_requested);
             let reqs = server.received_requests().await.unwrap();
             assert!(reqs.iter().all(|r| r.url.path() != "/api"));
+        })
+    }
+
+    async fn arc(server: &MockServer) {
+        api(
+            server,
+            "getStoryArc",
+            json!([
+                {"StoryArc": "Secret Wars", "ComicName": "Defenders", "IssueNumber": "152",
+                 "IssueDate": "1986-02-01", "IssueID": "777"},
+                {"StoryArc": "Secret Wars", "ComicName": "Saga", "IssueNumber": "1",
+                 "IssueDate": "2012-03-01", "IssueID": "9001"}
+            ]),
+        )
+        .await;
+    }
+
+    #[test]
+    fn story_arc_ids_split_on_underscore() {
+        assert_eq!(story_arc_id("55688_2753"), Some("55688"));
+        assert_eq!(story_arc_id("9001"), None);
+        assert_eq!(story_arc_id("_1"), None);
+        assert_eq!(story_arc_id("1_"), None);
+    }
+
+    #[test]
+    fn arc_issue_queues_through_the_readlist_route() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            arc(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/queueit"))
+                .and(query_param("mode", "readlist"))
+                .and(query_param("IssueArcID", "55688_2753"))
+                .and(query_param("SARC", "Secret Wars"))
+                .and(query_param("ComicName", "Defenders"))
+                .and(query_param("ComicIssue", "152"))
+                .and(query_param("ComicYear", "1986"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let m = client(&server);
+            let t = resolve(
+                &m,
+                Some("55688_2753"),
+                Some("defenders"),
+                Some("0152"),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                t.story_arc,
+                Some(ArcTarget {
+                    name: "Secret Wars".into(),
+                    year: "1986".into()
+                })
+            );
+            let r = queue("m", &m, t).await.unwrap();
+            assert_eq!(r.story_arc.as_deref(), Some("Secret Wars"));
+            assert!(r.search_requested && r.comic_id.is_none());
+            let reqs = server.received_requests().await.unwrap();
+            assert!(reqs
+                .iter()
+                .all(|r| r.url.query().is_none_or(|q| !q.contains("queueIssue"))));
+            let err = resolve(&m, Some("55688_2753"), Some("Defenders"), Some("9"), false)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no issue 'Defenders' #9"), "{err}");
+        })
+    }
+
+    #[test]
+    fn arc_issue_id_alone_is_refused_before_any_write() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            let m = client(&server);
+            let t = resolve(&m, Some("55688_2753"), None, None, false)
+                .await
+                .unwrap();
+            let err = queue("m", &m, t.clone()).await.unwrap_err().to_string();
+            assert!(err.contains("story-arc issue id (arc 55688)"), "{err}");
+            let err = fail("m", &m, t).await.unwrap_err().to_string();
+            assert!(err.contains("watchlist issues only"), "{err}");
+            assert!(server.received_requests().await.unwrap().is_empty());
         })
     }
 
@@ -547,6 +729,7 @@ mod tests {
             number: None,
             status: None,
             annual: false,
+            story_arc: None,
         }
     }
 
