@@ -528,6 +528,8 @@ mod tests {
             issue_number: Some("1".into()),
             release_date: Some(release.into()),
             issue_date: Some(cover.into()),
+            comic_id: None,
+            issue_id: None,
         }
     }
 

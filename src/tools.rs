@@ -3,6 +3,7 @@ use plugin_toolkit::prelude::*;
 use crate::acquisition::{ClientProvider, ResolvedDownloadClient};
 use crate::api::Mylar;
 use crate::execute;
+use crate::issues::{self, FailReport, QueueReport, WantedReport};
 use crate::logs::{self, LogsReport};
 use crate::reconcile::{self, ReconcileReport};
 use crate::remediate::{self, BacklogProcess, ConfigureReport};
@@ -300,6 +301,91 @@ async fn mylar3_backlog_process(args: BacklogArgs, ctx: &ToolCtx) -> Result<Back
     remediate::process_backlog(&args.name, &m, &args.folder, args.stuck_hours, args.execute).await
 }
 
+#[orca_struct(args)]
+pub struct IssueArgs {
+    /// Registered mylar3 endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Mylar IssueID; or give `series` and `issue_number`.
+    #[arg(long)]
+    #[serde(default)]
+    pub issue_id: Option<String>,
+    /// Watchlist series name (exact, case-insensitive) or ComicID.
+    #[arg(long)]
+    #[serde(default)]
+    pub series: Option<String>,
+    /// Issue number within `series`, e.g. `12` or `Annual 1`.
+    #[arg(long)]
+    #[serde(default)]
+    pub issue_number: Option<String>,
+}
+
+/// Mark an issue Wanted and search for it now (Mylar's queueIssue searches the one issue).
+#[orca_tool(
+    domain = "mylar3",
+    verb = "issue.queue",
+    role = "admin",
+    execute_gated = true
+)]
+async fn mylar3_issue_queue(args: IssueArgs, ctx: &ToolCtx) -> Result<QueueReport> {
+    execute::require_admin("mylar3.issue.queue", ctx)?;
+    let m = connect(&args.name).await?;
+    let target = issues::resolve(
+        &m,
+        args.issue_id.as_deref(),
+        args.series.as_deref(),
+        args.issue_number.as_deref(),
+    )
+    .await?;
+    issues::queue(&args.name, &m, target).await
+}
+
+/// Fail an issue's Snatched release so Mylar blocklists it and, with `failed_auto`, grabs a different one.
+#[orca_tool(
+    domain = "mylar3",
+    verb = "issue.fail",
+    role = "admin",
+    execute_gated = true
+)]
+async fn mylar3_issue_fail(args: IssueArgs, ctx: &ToolCtx) -> Result<FailReport> {
+    execute::require_admin("mylar3.issue.fail", ctx)?;
+    let m = connect(&args.name).await?;
+    let target = issues::resolve(
+        &m,
+        args.issue_id.as_deref(),
+        args.series.as_deref(),
+        args.issue_number.as_deref(),
+    )
+    .await?;
+    issues::fail(&args.name, &m, target).await
+}
+
+#[orca_struct(args)]
+pub struct WantedArgs {
+    /// Registered mylar3 endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Wanted issues to skip.
+    #[arg(long, default_value_t = 0)]
+    #[serde(default)]
+    pub offset: usize,
+    /// Wanted issues to return, at most 1000.
+    #[arg(long, default_value_t = issues::DEFAULT_LIMIT)]
+    #[serde(default = "default_wanted_limit")]
+    pub limit: usize,
+}
+
+fn default_wanted_limit() -> usize {
+    issues::DEFAULT_LIMIT
+}
+
+/// List the issues and annuals Mylar has marked Wanted.
+#[orca_tool(domain = "mylar3", verb = "wanted.list", role = "read")]
+async fn mylar3_wanted_list(args: WantedArgs, _ctx: &ToolCtx) -> Result<WantedReport> {
+    let m = connect(&args.name).await?;
+    issues::wanted(&args.name, &m, args.offset, args.limit).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +558,28 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.starts_with("mylar3.backlog.process"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_writes_require_admin() {
+        for role in [Some("user"), None] {
+            let args = || IssueArgs {
+                name: "m".into(),
+                issue_id: Some("1".into()),
+                series: None,
+                issue_number: None,
+            };
+            let err = mylar3_issue_queue(args(), &ctx(role))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("mylar3.issue.queue"), "{err}");
+            let err = mylar3_issue_fail(args(), &ctx(role))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("mylar3.issue.fail"), "{err}");
         }
     }
 }

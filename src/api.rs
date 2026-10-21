@@ -18,6 +18,8 @@ pub struct Mylar {
 pub struct Series {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -31,6 +33,10 @@ pub struct WantedIssue {
     pub release_date: Option<String>,
     #[serde(rename = "IssueDate", default)]
     pub issue_date: Option<String>,
+    #[serde(rename = "ComicID", default)]
+    pub comic_id: Option<String>,
+    #[serde(rename = "IssueID", default)]
+    pub issue_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -68,6 +74,8 @@ pub struct Snatch {
 pub struct IssueState {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub number: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
 }
@@ -286,6 +294,58 @@ impl Mylar {
             );
         }
         Ok(text)
+    }
+
+    pub async fn queue_issue(&self, issue_id: &str) -> Result<()> {
+        let body = self.api_raw("queueIssue", &[("id", issue_id)]).await?;
+        match body {
+            ResponseBody::Text { text } if text.trim() == "OK" => Ok(()),
+            ResponseBody::Json { json } => {
+                if let Some(msg) = json
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    bail!("mylar queueIssue refused: {}", self.redact(msg));
+                }
+                bail!(
+                    "mylar queueIssue: unexpected reply: {}",
+                    clip(&self.redact(&json.to_string()))
+                )
+            }
+            ResponseBody::Text { text } => bail!(
+                "mylar queueIssue: unexpected reply: {}",
+                clip(&self.redact(&text))
+            ),
+        }
+    }
+
+    pub async fn failed_handling(&self, comic_id: &str, issue_id: &str) -> Result<()> {
+        let what = "mylar /failed_handling";
+        let url = format!(
+            "{}/failed_handling?{}",
+            self.base,
+            form_encode(&[("ComicID", comic_id), ("IssueID", issue_id)])
+        );
+        let (status, body) = self.send(self.web(self.http.get(url))?, what).await?;
+        if status == 401 {
+            bail!(
+                "mylar /failed_handling: 401 — the web UI uses basic auth; set the endpoint's \
+                 web_username/web_password"
+            );
+        }
+        match self.success(what, status, body)? {
+            ResponseBody::Text { text } if text.trim().is_empty() => Ok(()),
+            ResponseBody::Text { .. } => bail!(
+                "mylar /failed_handling returned HTML (the forms login page): the web UI uses \
+                 forms login (authentication=2), which needs a cookie session the toolkit HTTP \
+                 client cannot establish"
+            ),
+            ResponseBody::Json { json } => bail!(
+                "mylar /failed_handling: unexpected reply: {}",
+                clip(&self.redact(&json.to_string()))
+            ),
+        }
     }
 
     pub async fn config(&self) -> Result<ConfigIni> {
