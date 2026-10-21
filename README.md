@@ -88,6 +88,7 @@ orca mylar3.backlog.process --name comics --folder /downloads/completed/comics -
 orca mylar3.wanted.list --name comics
 orca mylar3.issue.queue --name comics --series Saga --issue-number 12
 orca mylar3.issue.fail --name comics --issue-id 9012
+orca mylar3.configure --name comics --failed-download-handling true --failed-auto true --execute
 ```
 
 Mylar has no per-setting write: `mylar3.configure --execute` submits the web

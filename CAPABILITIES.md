@@ -16,10 +16,10 @@ generic `service.*` surface. Runtimes: **docker,podman,lxc**.
 ## Tools (`mylar3.`)
 - [x] endpoint registry `mylar3.{list,detail,create,update,delete}` — routes + api_key (secret) + web login (password secret)
 - [x] `status` — usenet retention vs oldest Wanted issue, completed-download handling, issues stuck at Snatched, search delay, torrent search without a client
-- [x] `configure` — converge `usenet_retention` (and `nzb_downloader` when SABnzbd is set but unused) through the web settings form; dry run by default
+- [x] `configure` — converge `usenet_retention` (and `nzb_downloader` when SABnzbd is set but unused) through the web settings form, plus `failed_download_handling` / `failed_auto` on request; dry run by default
 - [x] `backlog.process` — queue Mylar's post-processor over a folder inside `sab_directory`/`check_folder`, clear of the library; dry run by default
-- [x] `issue.queue` — mark an issue Wanted and search it (API `queueIssue`), by IssueID or series + issue number (`getIndex` + `getComic`); executes by default, `dryRun` previews
-- [x] `issue.fail` — fail an issue's Snatched release (web `/failed_handling`) so Mylar blocklists it and, with `failed_auto`, re-searches; refuses when `failed_download_handling` is off or no Snatched grab exists
+- [x] `issue.queue` — mark an issue Wanted, search requested (API `queueIssue`), by IssueID or series + issue number (`getIndex` + `getComic`); `--annual` queues the series' annual via web `/queueit?mode=want_ann`; executes by default, `dryRun` previews
+- [x] `issue.fail` — fail an issue's Snatched release (web `/failed_handling`) so Mylar's search skips it; with `failed_auto` it marks the issue Wanted and requests a search; re-reads the issue and errors if unchanged; refuses annuals, `failed_download_handling` off, or no Snatched grab
 - [x] `wanted.list` — Wanted issues and annuals with ComicID/IssueID (API `getWanted`), paged
 
 ## Provided generically by orca (NO code here)

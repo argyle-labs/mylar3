@@ -84,6 +84,8 @@ pub struct IssueState {
 #[serde(crate = "plugin_toolkit::serde")]
 pub struct ComicIssues {
     #[serde(default)]
+    pub comic: Vec<Series>,
+    #[serde(default)]
     pub issues: Vec<IssueState>,
     #[serde(default)]
     pub annuals: Vec<IssueState>,
@@ -320,29 +322,52 @@ impl Mylar {
         }
     }
 
+    pub async fn queue_annual(
+        &self,
+        comic_id: &str,
+        issue_id: &str,
+        number: &str,
+        comic_name: Option<&str>,
+    ) -> Result<()> {
+        let mut query = vec![
+            ("mode", "want_ann"),
+            ("ComicID", comic_id),
+            ("IssueID", issue_id),
+            ("ComicIssue", number),
+        ];
+        if let Some(n) = comic_name {
+            query.push(("ComicName", n));
+        }
+        self.web_get_empty("/queueit", &query).await
+    }
+
     pub async fn failed_handling(&self, comic_id: &str, issue_id: &str) -> Result<()> {
-        let what = "mylar /failed_handling";
-        let url = format!(
-            "{}/failed_handling?{}",
-            self.base,
-            form_encode(&[("ComicID", comic_id), ("IssueID", issue_id)])
-        );
-        let (status, body) = self.send(self.web(self.http.get(url))?, what).await?;
+        self.web_get_empty(
+            "/failed_handling",
+            &[("ComicID", comic_id), ("IssueID", issue_id)],
+        )
+        .await
+    }
+
+    async fn web_get_empty(&self, route: &str, query: &[(&str, &str)]) -> Result<()> {
+        let what = format!("mylar {route}");
+        let url = format!("{}{route}?{}", self.base, form_encode(query));
+        let (status, body) = self.send(self.web(self.http.get(url))?, &what).await?;
         if status == 401 {
             bail!(
-                "mylar /failed_handling: 401 — the web UI uses basic auth; set the endpoint's \
+                "{what}: 401 — the web UI uses basic auth; set the endpoint's \
                  web_username/web_password"
             );
         }
-        match self.success(what, status, body)? {
+        match self.success(&what, status, body)? {
             ResponseBody::Text { text } if text.trim().is_empty() => Ok(()),
             ResponseBody::Text { .. } => bail!(
-                "mylar /failed_handling returned HTML (the forms login page): the web UI uses \
-                 forms login (authentication=2), which needs a cookie session the toolkit HTTP \
-                 client cannot establish"
+                "{what} returned HTML (the forms login page): the web UI uses forms login \
+                 (authentication=2), which needs a cookie session the toolkit HTTP client \
+                 cannot establish"
             ),
             ResponseBody::Json { json } => bail!(
-                "mylar /failed_handling: unexpected reply: {}",
+                "{what}: unexpected reply: {}",
                 clip(&self.redact(&json.to_string()))
             ),
         }
