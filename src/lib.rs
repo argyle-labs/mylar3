@@ -5,6 +5,7 @@ pub mod api;
 mod definitions;
 pub mod execute;
 pub mod ini;
+pub mod issues;
 pub mod logs;
 pub mod reconcile;
 pub mod remediate;

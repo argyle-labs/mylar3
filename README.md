@@ -85,6 +85,9 @@ orca mylar3.status --name comics                      # findings: retention, pos
 orca mylar3.configure --name comics                   # dry run: reports settings drift
 orca mylar3.configure --name comics --usenet-retention 6000 --execute
 orca mylar3.backlog.process --name comics --folder /downloads/completed/comics --execute
+orca mylar3.wanted.list --name comics
+orca mylar3.issue.queue --name comics --series Saga --issue-number 12
+orca mylar3.issue.fail --name comics --issue-id 9012
 ```
 
 Mylar has no per-setting write: `mylar3.configure --execute` submits the web
