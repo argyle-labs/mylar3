@@ -23,26 +23,16 @@ pub struct Mylar3Endpoint {
 
 pub async fn connect(name: &str) -> Result<Mylar> {
     let row = endpoint_db::require(name)?;
-    let api_key = plugin_toolkit::secrets::resolve_scoped(
-        "mylar3",
-        name,
-        "api_key",
-        (!row.api_key.is_empty()).then_some(row.api_key.as_str()),
-    )?;
+    let api_key = plugin_toolkit::secrets::resolve_scoped("mylar3", name, "api_key")?;
     let web_auth = match row.web_username.filter(|u| !u.is_empty()) {
         Some(user) => {
-            let pass = plugin_toolkit::secrets::resolve_scoped(
-                "mylar3",
-                name,
-                "web_password",
-                row.web_password.as_deref(),
-            )?;
-            Some((user, pass))
+            let pass = plugin_toolkit::secrets::resolve_scoped("mylar3", name, "web_password")?;
+            Some((user, pass.expose_secret().clone()))
         }
         None => None,
     };
     let base_url = route::resolve_reachable(name, &row.routes, false).await?;
-    Ok(Mylar::new(&base_url, &api_key, web_auth))
+    Ok(Mylar::new(&base_url, api_key.expose_secret(), web_auth))
 }
 
 pub const DEFAULT_STUCK_HOURS: u32 = 24;
@@ -193,7 +183,9 @@ pub struct ConfigureArgs {
 async fn mylar3_configure(args: ConfigureArgs, ctx: &ToolCtx) -> Result<ConfigureReport> {
     const TOOL: &str = "mylar3.configure";
     execute::require_admin(TOOL, ctx)?;
-    let torrent = torrent_client(&args, plugin_toolkit::secrets::get_required)?;
+    let torrent = torrent_client(&args, |name| {
+        plugin_toolkit::secrets::get_required(name).map(|s| s.expose_secret().clone())
+    })?;
     let toggles: Vec<(&str, bool)> = [
         ("failed_download_handling", args.failed_download_handling),
         ("failed_auto", args.failed_auto),
