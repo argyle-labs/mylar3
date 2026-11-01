@@ -446,7 +446,25 @@ pub async fn configure(
         .context("read Mylar's Wanted list to size usenet_retention")?;
     let floor = retention_floor(&wanted, Timestamp::now());
     let (mut changes, manual) = plan(&before, usenet_retention, floor);
+    let explicit = toggles
+        .iter()
+        .any(|(k, _)| *k == "failed_download_handling");
+    let mut toggles = toggles.to_vec();
+    if !explicit {
+        toggles.push(("failed_download_handling", true));
+    }
+    let toggles = toggles.as_slice();
     changes.extend(plan_toggles(&before, toggles));
+    if !explicit {
+        for c in changes
+            .iter_mut()
+            .filter(|c| c.key == "failed_download_handling")
+        {
+            c.reason = "off, Mylar keeps no failed list and re-grabs the same release after a \
+                        failed download"
+                .into();
+        }
+    }
     let mut posted = changes.clone();
     if let Some(client) = torrent {
         let (shown, values) = plan_torrent(&before, client)?;
@@ -667,6 +685,7 @@ mod tests {
             .collect();
         for (k, v) in [
             ("minimal_ini", "False"),
+            ("failed_download_handling", "True"),
             ("usenet_retention", "3500"),
             ("newznab", "True"),
             ("post_processing", "True"),
@@ -1305,6 +1324,39 @@ mod tests {
         let (c, manual) = plan(&at6000, Some(7000), 10141);
         assert_eq!(c[0].target, "7000");
         assert!(manual[0].contains("10141"), "{manual:?}");
+    }
+
+    #[test]
+    fn configure_turns_on_failed_handling_unless_told_otherwise() {
+        crate::mock::run(async {
+            let rows = table(&[
+                ("usenet_retention", "6000"),
+                ("failed_download_handling", "False"),
+            ]);
+            let server = server(&[rows], ok()).await;
+            let r = configure("m", &mylar(&server), None, None, &[], false)
+                .await
+                .unwrap();
+            assert_eq!(r.changes.len(), 1);
+            assert_eq!(r.changes[0].key, "failed_download_handling");
+            assert_eq!(r.changes[0].target, "True");
+            assert!(
+                r.changes[0].reason.contains("re-grabs"),
+                "{:?}",
+                r.changes[0]
+            );
+            let r = configure(
+                "m",
+                &mylar(&server),
+                None,
+                None,
+                &[("failed_download_handling", false)],
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(r.in_sync, "{:?}", r.changes);
+        })
     }
 
     #[test]

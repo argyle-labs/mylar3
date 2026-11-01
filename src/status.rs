@@ -24,6 +24,7 @@ const KEYS: &[&str] = &[
     "enable_torrent_search",
     "enable_torznab",
     "torrent_downloader",
+    "failed_download_handling",
 ];
 
 const STUCK_SAMPLE: usize = 10;
@@ -191,13 +192,30 @@ pub fn build(
     findings.extend(post_processing_findings(&ini, &post_processing));
     if stuck_snatched.count > 0 {
         findings.push(format!(
-            "{} issues stuck at Snatched for more than {}h (oldest {}); {} issues grabbed \
-             more than once",
+            "{} issues stuck at Snatched for more than {}h (oldest {})",
             stuck_snatched.count,
             stuck_hours,
             stuck_snatched.oldest.as_deref().unwrap_or("?"),
+        ));
+    }
+    if stuck_snatched.repeat_grabbed > 0 {
+        let cause = if ini.flag("failed_download_handling") == Some(false) {
+            "failed_download_handling is off, so Mylar keeps no failed list and re-grabs the \
+             same release; mylar3.configure --execute turns it on"
+        } else {
+            "earlier grabs never imported and were not failed, so their releases stay eligible"
+        };
+        findings.push(format!(
+            "{} issues grabbed more than once: {cause}",
             stuck_snatched.repeat_grabbed,
         ));
+    }
+    if ini.flag("failed_download_handling") == Some(false) && stuck_snatched.repeat_grabbed == 0 {
+        findings.push(
+            "failed_download_handling is off: a failed download leaves the release eligible \
+             and Mylar grabs it again"
+                .into(),
+        );
     }
     if search.search_delay_valid == Some(false) {
         findings.push(format!(
@@ -682,6 +700,43 @@ mod tests {
         assert_eq!(s.stuck_snatched.sample[0].comic, "C1");
         let s = build("m", 0, &Wanted::default(), &history, Ok(ini(&[])), 1, now());
         assert_eq!(s.stuck_snatched.count, 2);
+    }
+
+    #[test]
+    fn repeat_grabs_are_a_finding_and_name_failed_handling() {
+        let history = vec![
+            snatch("1", "2026-10-05 08:00:00", "Snatched"),
+            snatch("1", "2026-10-05 09:00:00", "Snatched"),
+        ];
+        let at = |fdh: &str| {
+            build(
+                "m",
+                0,
+                &Wanted::default(),
+                &history,
+                Ok(ini(&[("failed_download_handling", fdh)])),
+                24,
+                now(),
+            )
+        };
+        let s = at("False");
+        assert_eq!(s.stuck_snatched.count, 0);
+        assert_eq!(s.findings.len(), 1, "{:?}", s.findings);
+        assert!(s.findings[0].contains("1 issues grabbed more than once"));
+        assert!(s.findings[0].contains("failed_download_handling is off"));
+        let s = at("True");
+        assert_eq!(s.findings.len(), 1, "{:?}", s.findings);
+        assert!(s.findings[0].contains("not failed"));
+        let s = build(
+            "m",
+            0,
+            &Wanted::default(),
+            &[],
+            Ok(ini(&[("failed_download_handling", "False")])),
+            24,
+            now(),
+        );
+        assert!(s.findings[0].starts_with("failed_download_handling is off"));
     }
 
     #[test]
