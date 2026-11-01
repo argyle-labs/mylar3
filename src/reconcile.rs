@@ -699,41 +699,48 @@ mod tests {
                 })))
                 .mount(&mylar)
                 .await;
+            // The fillers and "c" fill status::current's series-lookup cap, so only the guard reads "late".
+            let fillers = status::MAX_SERIES_LOOKUPS - 1;
+            let snatch = |issue: &str, comic: &str, date: &str| {
+                serde_json::json!({"IssueID": issue, "ComicID": comic, "ComicName": "Saga",
+                                   "Issue_Number": issue, "DateAdded": date, "Status": "Snatched"})
+            };
+            let mut history: Vec<_> = (0..fillers)
+                .map(|i| snatch(&format!("f{i}"), &format!("f{i}"), "2019-01-01 00:00:00"))
+                .collect();
+            history.push(snatch("1", "c", "2019-01-01 00:00:00"));
+            history.push(snatch("2", "late", "2020-01-01 00:00:00"));
+            history.push(snatch("3", "late", "2020-01-01 00:00:00"));
             Mock::given(method("GET"))
                 .and(path("/api"))
                 .and(query_param("cmd", "getHistory"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "success": true,
-                    "data": [{"IssueID": "1", "ComicID": "c", "ComicName": "Saga", "Issue_Number": "1",
-                              "DateAdded": "2020-01-01 00:00:00", "Status": "Snatched"},
-                             {"IssueID": "2", "ComicID": "c", "ComicName": "Saga", "Issue_Number": "2",
-                              "DateAdded": "2020-01-01 00:00:00", "Status": "Snatched"}]
-                })))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"success": true, "data": history})),
+                )
                 .mount(&mylar)
                 .await;
-            Mock::given(method("GET"))
-                .and(path("/api"))
-                .and(query_param("cmd", "getComic"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "success": true,
-                    "data": {"comic": [], "issues": [
-                        {"id": "1", "status": "Snatched"}, {"id": "2", "status": "Snatched"}
-                    ], "annuals": []}
-                })))
-                .up_to_n_times(1)
-                .mount(&mylar)
-                .await;
-            Mock::given(method("GET"))
-                .and(path("/api"))
-                .and(query_param("cmd", "getComic"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "success": true,
-                    "data": {"comic": [], "issues": [
-                        {"id": "1", "status": "Snatched"}, {"id": "2", "status": "Downloaded"}
-                    ], "annuals": []}
-                })))
-                .mount(&mylar)
-                .await;
+            let comics = (0..fillers)
+                .map(|i| (format!("f{i}"), serde_json::json!([{"id": format!("f{i}"), "status": "Snatched"}])))
+                .chain([
+                    ("c".to_string(), serde_json::json!([{"id": "1", "status": "Snatched"}])),
+                    (
+                        "late".to_string(),
+                        serde_json::json!([{"id": "2", "status": "Downloaded"}, {"id": "3", "status": "Snatched"}]),
+                    ),
+                ]);
+            for (id, issues) in comics {
+                Mock::given(method("GET"))
+                    .and(path("/api"))
+                    .and(query_param("cmd", "getComic"))
+                    .and(query_param("id", id.as_str()))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "success": true,
+                        "data": {"comic": [], "issues": issues, "annuals": []}
+                    })))
+                    .mount(&mylar)
+                    .await;
+            }
             for mode in ["queue", "history"] {
                 Mock::given(method("GET"))
                     .and(path("/api"))
@@ -748,9 +755,10 @@ mod tests {
             let r = resolve("m", &m, 24, true, DEFAULT_MISSING_AFTER_DAYS, false)
                 .await
                 .unwrap();
-            assert_eq!(r.summary.sab_missing, 2);
+            assert_eq!(r.summary.sab_missing, fillers + 3);
             let row = |id: &str| r.rows.iter().find(|g| g.issue_id == id).unwrap();
             assert_eq!(row("1").action, "fail");
+            assert_eq!(row("3").action, "fail");
             assert_eq!(row("2").action, "review");
             let r = resolve("m", &m, 24, false, DEFAULT_MISSING_AFTER_DAYS, false)
                 .await
