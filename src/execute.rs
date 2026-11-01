@@ -7,7 +7,7 @@ pub fn require_admin(tool: &str, ctx: &ToolCtx) -> Result<()> {
 
 fn check_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
     match caller {
-        Some(c) if c.role == "admin" => Ok(()),
+        Some(c) if matches!(c.role.as_str(), "admin" | "super-admin") => Ok(()),
         Some(c) => bail!(
             "{subject} requires role 'admin'; caller '{}' has '{}'",
             c.username,
@@ -35,6 +35,7 @@ mod tests {
     #[test]
     fn needs_an_admin_caller() {
         assert!(check_admin("t", Some(&caller("admin"))).is_ok());
+        assert!(check_admin("t", Some(&caller("super-admin"))).is_ok());
         let err = check_admin("t", Some(&caller("user"))).unwrap_err();
         assert!(err.to_string().contains("requires role 'admin'"), "{err}");
         let err = check_admin("t", None).unwrap_err();
