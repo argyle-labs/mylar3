@@ -445,7 +445,7 @@ pub async fn configure(
         .await
         .context("read Mylar's Wanted list to size usenet_retention")?;
     let floor = retention_floor(&wanted, Timestamp::now());
-    let (mut changes, manual) = plan(&before, usenet_retention, floor);
+    let (mut changes, mut manual) = plan(&before, usenet_retention, floor);
     let explicit = toggles
         .iter()
         .any(|(k, _)| *k == "failed_download_handling");
@@ -463,6 +463,11 @@ pub async fn configure(
             c.reason = "off, Mylar keeps no failed list and re-grabs the same release after a \
                         failed download"
                 .into();
+            manual.push(
+                "failed_download_handling was off in Mylar; orca turned it on (repeat-grab \
+                 guard). Pass --failed-download-handling false to keep it off."
+                    .into(),
+            );
         }
     }
     let mut posted = changes.clone();
@@ -1345,6 +1350,12 @@ mod tests {
                 "{:?}",
                 r.changes[0]
             );
+            assert_eq!(r.manual.len(), 1, "{:?}", r.manual);
+            assert!(
+                r.manual[0].contains("--failed-download-handling false"),
+                "{:?}",
+                r.manual
+            );
             let r = configure(
                 "m",
                 &mylar(&server),
@@ -1355,6 +1366,22 @@ mod tests {
             )
             .await
             .unwrap();
+            assert!(r.in_sync, "{:?}", r.changes);
+        })
+    }
+
+    #[test]
+    fn configure_adds_no_failed_handling_note_when_already_on() {
+        crate::mock::run(async {
+            let rows = table(&[
+                ("usenet_retention", "6000"),
+                ("failed_download_handling", "True"),
+            ]);
+            let server = server(&[rows], ok()).await;
+            let r = configure("m", &mylar(&server), None, None, &[], false)
+                .await
+                .unwrap();
+            assert!(r.manual.is_empty(), "{:?}", r.manual);
             assert!(r.in_sync, "{:?}", r.changes);
         })
     }
