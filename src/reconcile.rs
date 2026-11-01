@@ -1,5 +1,6 @@
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::time::Timestamp;
+use std::collections::HashSet;
 
 use crate::api::{ConfigIni, Mylar, Snatch};
 use crate::issues::{self, Resolved};
@@ -300,7 +301,7 @@ fn classify(s: &Snatch, grabs: usize, named: &[(Vec<String>, &HistorySlot)]) -> 
         .collect();
     let by_name: Vec<&HistorySlot> = series
         .iter()
-        .filter(|(t, _)| issue_matches(&issue, t))
+        .filter(|(t, _)| issue_matches(&issue, t) && same_series(&comic_tokens, &issue, t))
         .map(|(_, slot)| *slot)
         .collect();
     let (matched_by, matches) = if !by_id.is_empty() {
@@ -364,6 +365,23 @@ fn series_tokens(comic: &str) -> Vec<String> {
         .into_iter()
         .filter(|t| !matches!(t.as_str(), "the" | "a" | "an" | "and" | "of"))
         .collect()
+}
+
+fn same_series(comic: &[String], issue: &str, name: &[String]) -> bool {
+    let issue_words: Vec<String> = issue.split_whitespace().flat_map(tokens).collect();
+    let is_volume =
+        |t: &str| t.len() > 1 && t.starts_with('v') && t[1..].bytes().all(|b| b.is_ascii_digit());
+    let job: HashSet<&str> = name
+        .iter()
+        .take_while(|t| !t.starts_with(|c: char| c.is_ascii_digit()))
+        .map(String::as_str)
+        .filter(|t| {
+            !matches!(*t, "the" | "a" | "an" | "and" | "of")
+                && !is_volume(t)
+                && !issue_words.iter().any(|w| w == t)
+        })
+        .collect();
+    job == comic.iter().map(String::as_str).collect()
 }
 
 fn issue_number(t: &str) -> &str {
@@ -593,6 +611,36 @@ mod tests {
             let out = serde_json::to_string(&r).unwrap();
             assert!(!out.contains("SABKEY"), "{out}");
         })
+    }
+
+    #[test]
+    fn looser_series_name_is_review_not_fail() {
+        let at = old();
+        let history = vec![
+            snatch("1", "Batman", "1", &at, None),
+            snatch("2", "Defenders", "152", &at, None),
+        ];
+        let slots = vec![
+            slot("a", "Batman Beyond 001 (2016)", "Failed", 10),
+            slot("b", "The.Defenders.v1.152.1986.Digital", "Failed", 11),
+        ];
+        let r = build(
+            "m",
+            "h",
+            "comics",
+            &history,
+            &slots,
+            24,
+            now(),
+            Page::default(),
+        );
+        let row = |id: &str| r.rows.iter().find(|r| r.issue_id == id).unwrap();
+        assert_eq!(row("1").class, "name_mismatch");
+        assert!(row("1").matched_by.is_none());
+        assert_eq!(row("2").class, "sab_failed");
+        let rows = actions(&r.rows, true);
+        let batman = rows.iter().find(|r| r.issue_id == "1").unwrap();
+        assert_eq!(batman.action, "none");
     }
 
     #[test]
