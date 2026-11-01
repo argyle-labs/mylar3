@@ -380,12 +380,11 @@ fn post_processing_findings(ini: &ConfigIni, pp: &PostProcessingCheck) -> Vec<St
 }
 
 /// Mylar stores `DateAdded` in its host's local time and its API exposes no timezone, so the
-/// cutoff is shifted back by the largest UTC offset (+14h): anything older than the result is older
-/// than `t` in every timezone.
-const MAX_UTC_OFFSET: Duration = Duration::from_secs(14 * 3600);
+/// cutoff is shifted back by the most negative UTC offset (UTC-12), the earliest any local clock reads.
+const MAX_NEGATIVE_UTC_OFFSET: Duration = Duration::from_secs(12 * 3600);
 
 pub fn earliest_mylar_local_time(t: Timestamp) -> String {
-    mylar_time(t.minus(MAX_UTC_OFFSET))
+    mylar_time(t.minus(MAX_NEGATIVE_UTC_OFFSET))
 }
 
 fn mylar_time(t: Timestamp) -> String {
@@ -581,8 +580,8 @@ mod tests {
     }
 
     #[test]
-    fn mylar_cutoff_is_shifted_back_by_the_largest_utc_offset() {
-        assert_eq!(earliest_mylar_local_time(now()), "2026-10-04 22:00:00");
+    fn mylar_cutoff_is_shifted_back_by_the_most_negative_utc_offset() {
+        assert_eq!(earliest_mylar_local_time(now()), "2026-10-05 00:00:00");
     }
 
     #[test]
