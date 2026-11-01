@@ -131,7 +131,7 @@ pub struct ConfigureArgs {
     /// Registered mylar3 endpoint name.
     #[arg(long)]
     pub name: String,
-    /// Days of usenet retention advertised to indexers (newznab `maxage`); omitted, raises anything below 6000 to 6000.
+    /// Days of usenet retention advertised to indexers (newznab `maxage`); omitted, raises it to reach the oldest Wanted issue, at least 6000.
     #[arg(long)]
     #[serde(default)]
     pub usenet_retention: Option<u32>,

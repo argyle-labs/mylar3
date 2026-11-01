@@ -44,6 +44,8 @@ pub struct RetentionCheck {
     pub wanted_before_cutoff: Option<usize>,
     /// The cutoff hides at least one Wanted issue.
     pub drift: Option<bool>,
+    /// Smallest retention, in days, whose cutoff reaches `oldest_wanted_date`.
+    pub covering_days: Option<i64>,
 }
 
 #[orca_struct]
@@ -176,12 +178,14 @@ pub fn build(
     if retention.drift == Some(true) {
         findings.push(format!(
             "usenet_retention={} sends maxage={} so indexers drop posts before {}; {} of {} \
-             dated Wanted issues were released before that",
+             dated Wanted issues were released before that; mylar3.configure --execute raises \
+             it to {}",
             retention.usenet_retention_days.unwrap_or_default(),
             retention.usenet_retention_days.unwrap_or_default(),
             retention.cutoff_date.as_deref().unwrap_or("?"),
             retention.wanted_before_cutoff.unwrap_or_default(),
             retention.wanted_dated,
+            retention.covering_days.unwrap_or_default(),
         ));
     }
     findings.extend(post_processing_findings(&ini, &post_processing));
@@ -226,7 +230,7 @@ pub fn build(
     }
 }
 
-fn issue_date(i: &WantedIssue) -> Option<String> {
+pub fn issue_date(i: &WantedIssue) -> Option<String> {
     [&i.release_date, &i.issue_date]
         .into_iter()
         .flatten()
@@ -252,11 +256,31 @@ fn retention(ini: &ConfigIni, issues: &[&WantedIssue], now: Timestamp) -> Retent
     RetentionCheck {
         usenet_retention_days: days,
         drift: wanted_before_cutoff.map(|n| n > 0),
+        covering_days: oldest_wanted_date
+            .as_deref()
+            .and_then(|d| covering_days(d, now)),
         cutoff_date,
         oldest_wanted_date,
         wanted_dated: dates.len(),
         wanted_before_cutoff,
     }
+}
+
+/// Days back from `now` to the start of `date` (`YYYY-MM-DD`, a `00` month or day read as `01`), plus one so the cutoff lands before it.
+pub fn covering_days(date: &str, now: Timestamp) -> Option<i64> {
+    let mut parts = date.splitn(3, '-');
+    let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
+    let unzero = |p: &str| {
+        if p == "00" {
+            "01".to_string()
+        } else {
+            p.to_string()
+        }
+    };
+    let day =
+        Timestamp::parse_rfc3339(&format!("{y}-{}-{}T00:00:00Z", unzero(m), unzero(d))).ok()?;
+    let secs = now.unix_seconds() - day.unix_seconds();
+    (secs >= 0).then(|| (secs + 86_399) / 86_400 + 1)
 }
 
 fn nzb_downloader_name(v: i64) -> String {
@@ -575,7 +599,19 @@ mod tests {
         assert_eq!(s.retention.drift, Some(true));
         assert_eq!(s.wanted, 4);
         assert!(s.findings.iter().any(|f| f.contains("maxage=3500")));
+        assert_eq!(s.retention.covering_days, Some(10141));
         assert!(!s.healthy);
+
+        let s = build(
+            "m",
+            3,
+            &wanted,
+            &[],
+            Ok(ini(&[("usenet_retention", "10141")])),
+            24,
+            now(),
+        );
+        assert_eq!(s.retention.drift, Some(false));
 
         let s = build(
             "m",
@@ -587,6 +623,14 @@ mod tests {
             now(),
         );
         assert_eq!(s.retention.drift, Some(false));
+    }
+
+    #[test]
+    fn covering_days_reaches_the_date() {
+        assert_eq!(covering_days("2026-10-05", now()), Some(2));
+        assert_eq!(covering_days("2026-10-04", now()), Some(3));
+        assert_eq!(covering_days("2027-01-01", now()), None);
+        assert_eq!(covering_days("garbage", now()), None);
     }
 
     #[test]
