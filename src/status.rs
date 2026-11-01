@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::time::Timestamp;
 
-use crate::api::{ConfigIni, Mylar, Snatch, Wanted, WantedIssue};
+use crate::api::{ConfigIni, IssueState, Mylar, Snatch, Wanted, WantedIssue};
 
 const KEYS: &[&str] = &[
     "usenet_retention",
@@ -386,12 +386,24 @@ pub fn utc_as_mylar_local_time(t: Timestamp) -> String {
         .to_string()
 }
 
+/// Issues and annuals of each series read, keyed by comic id.
+pub type SeriesIssues = HashMap<String, Vec<IssueState>>;
+
 pub async fn current(
     m: &Mylar,
     history: Vec<Snatch>,
     stuck_hours: u32,
     now: Timestamp,
 ) -> Result<Vec<Snatch>> {
+    Ok(current_with_series(m, history, stuck_hours, now).await?.0)
+}
+
+pub async fn current_with_series(
+    m: &Mylar,
+    history: Vec<Snatch>,
+    stuck_hours: u32,
+    now: Timestamp,
+) -> Result<(Vec<Snatch>, SeriesIssues)> {
     let mut seen = BTreeSet::new();
     let comics: Vec<String> = stuck_snatches(&history, stuck_hours, now)
         .0
@@ -401,17 +413,19 @@ pub async fn current(
         .take(MAX_SERIES_LOOKUPS)
         .collect();
     let mut moved_on = BTreeSet::new();
+    let mut series = SeriesIssues::new();
     for id in comics {
         let c = m.comic(&id).await?;
+        let issues: Vec<IssueState> = c.issues.into_iter().chain(c.annuals).collect();
         moved_on.extend(
-            c.issues
-                .into_iter()
-                .chain(c.annuals)
+            issues
+                .iter()
                 .filter(|i| i.status.as_deref() != Some("Snatched"))
-                .filter_map(|i| i.id),
+                .filter_map(|i| i.id.clone()),
         );
+        series.insert(id, issues);
     }
-    Ok(drop_moved_on(history, &moved_on))
+    Ok((drop_moved_on(history, &moved_on), series))
 }
 
 fn drop_moved_on(history: Vec<Snatch>, moved_on: &BTreeSet<String>) -> Vec<Snatch> {

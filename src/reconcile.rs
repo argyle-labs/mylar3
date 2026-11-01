@@ -1,6 +1,7 @@
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::reactor;
 use plugin_toolkit::time::Timestamp;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use crate::api::{ConfigIni, Mylar, Snatch};
@@ -10,6 +11,9 @@ use crate::status;
 
 pub const DEFAULT_CATEGORY: &str = "comics";
 pub const DEFAULT_LIMIT: usize = 200;
+/// `getComic` calls the missing guard makes beyond the series `status::current` already read.
+pub const MAX_GUARD_LOOKUPS: usize = 50;
+const GUARD_CONCURRENCY: usize = 4;
 pub const MAX_LIMIT: usize = 1000;
 /// Stuck grabs `resolve` will act on in one run; more is an error, never a truncation.
 pub const RESOLVE_CAP: usize = 50_000;
@@ -91,12 +95,14 @@ struct Inputs {
     history: Vec<Snatch>,
     queue: Vec<HistorySlot>,
     slots: Vec<HistorySlot>,
+    series: status::SeriesIssues,
 }
 
 async fn fetch(m: &Mylar, stuck_hours: u32) -> Result<Inputs> {
     let ini = m.config().await?;
     let (host, key, category) = sab_settings(&ini)?;
-    let history = status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
+    let (history, series) =
+        status::current_with_series(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
     let sab = Sab::new(host, key);
     let queue = sab.queue().await?;
     let slots = sab.history().await?;
@@ -106,6 +112,7 @@ async fn fetch(m: &Mylar, stuck_hours: u32) -> Result<Inputs> {
         history,
         queue,
         slots,
+        series,
     })
 }
 
@@ -211,6 +218,8 @@ pub struct Missing {
     pub before: String,
     /// Issues Mylar's issue table still shows as `Snatched`.
     pub still_snatched: HashSet<String>,
+    /// Series left unread once the guard's lookup cap was reached.
+    pub unchecked: HashSet<String>,
 }
 
 fn missing_reason(r: &ReconciledSnatch, m: &Missing) -> Option<String> {
@@ -218,6 +227,11 @@ fn missing_reason(r: &ReconciledSnatch, m: &Missing) -> Option<String> {
         return Some(format!(
             "snatched {} is newer than the missing cutoff {}",
             r.snatched_at, m.before
+        ));
+    }
+    if let Some(id) = r.comic_id.as_deref().filter(|id| m.unchecked.contains(*id)) {
+        return Some(format!(
+            "series {id} was not checked: the missing guard reads at most {MAX_GUARD_LOOKUPS} series per run"
         ));
     }
     if !m.still_snatched.contains(&r.issue_id) {
@@ -275,13 +289,14 @@ pub async fn resolve(
     let before = status::utc_as_mylar_local_time(
         Timestamp::now().minus(Duration::from_secs(u64::from(missing_after_days) * 86_400)),
     );
-    let guard = Missing {
-        before,
-        still_snatched: if include_missing {
-            still_snatched(m, &stuck).await
-        } else {
-            HashSet::new()
-        },
+    let guard = if include_missing {
+        still_snatched(m, &stuck, inputs.series, MAX_GUARD_LOOKUPS, before).await
+    } else {
+        Missing {
+            before,
+            still_snatched: HashSet::new(),
+            unchecked: HashSet::new(),
+        }
     };
     let mut rows = actions(&stuck, include_missing.then_some(&guard));
     if execute {
@@ -313,27 +328,49 @@ pub async fn resolve(
     })
 }
 
-/// A series that cannot be read leaves its issues out, so they stay `review`.
-async fn still_snatched(m: &Mylar, rows: &[ReconciledSnatch]) -> HashSet<String> {
-    let comics: HashSet<&str> = rows
+/// A series that cannot be read leaves its issues out, so they stay `review`. Series `known` already
+/// holds are not read again; series beyond `cap` reads go to `unchecked`.
+async fn still_snatched(
+    m: &Mylar,
+    rows: &[ReconciledSnatch],
+    mut known: status::SeriesIssues,
+    cap: usize,
+    before: String,
+) -> Missing {
+    let comics: BTreeSet<&str> = rows
         .iter()
         .filter(|r| r.class == "sab_missing")
         .filter_map(|r| r.comic_id.as_deref())
         .collect();
-    let mut out = HashSet::new();
-    for id in comics {
-        let Ok(c) = m.comic(id).await else {
-            continue;
-        };
-        out.extend(
-            c.issues
-                .into_iter()
-                .chain(c.annuals)
-                .filter(|i| i.status.as_deref() == Some("Snatched"))
-                .filter_map(|i| i.id),
-        );
+    let mut unread: Vec<&str> = comics
+        .iter()
+        .copied()
+        .filter(|id| !known.contains_key(*id))
+        .collect();
+    let unchecked = unread.split_off(cap.min(unread.len()));
+    for chunk in unread.chunks(GUARD_CONCURRENCY) {
+        let read = reactor::join_all(chunk.iter().map(|id| m.comic(id))).await;
+        for (id, c) in chunk.iter().zip(read) {
+            if let Ok(c) = c {
+                known.insert(
+                    id.to_string(),
+                    c.issues.into_iter().chain(c.annuals).collect(),
+                );
+            }
+        }
     }
-    out
+    let still_snatched = comics
+        .iter()
+        .filter_map(|id| known.remove(*id))
+        .flatten()
+        .filter(|i| i.status.as_deref() == Some("Snatched"))
+        .filter_map(|i| i.id)
+        .collect();
+    Missing {
+        before,
+        still_snatched,
+        unchecked: unchecked.into_iter().map(str::to_string).collect(),
+    }
 }
 
 fn sab_settings(ini: &ConfigIni) -> Result<(&str, &str, String)> {
@@ -669,6 +706,7 @@ fn issue_matches(issue: &str, name: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::IssueState;
     use crate::mock::matchers::{method, path, query_param};
     use crate::mock::{Mock, MockServer, ResponseTemplate};
     use plugin_toolkit::serde_json;
@@ -715,6 +753,7 @@ mod tests {
         Missing {
             before: now().to_rfc3339().replacen('T', " ", 1)[..19].to_string(),
             still_snatched: ["5".to_string()].into(),
+            unchecked: HashSet::new(),
         }
     }
 
@@ -859,10 +898,94 @@ mod tests {
             assert_eq!(row("1").action, "fail");
             assert_eq!(row("3").action, "fail");
             assert_eq!(row("2").action, "review");
+            assert_eq!(comic_reads(&mylar, "c").await, 1);
+            assert_eq!(comic_reads(&mylar, "late").await, 1);
             let r = resolve("m", &m, 24, false, DEFAULT_MISSING_AFTER_DAYS, false)
                 .await
                 .unwrap();
             assert!(r.rows.iter().all(|g| g.action == "none"));
+        })
+    }
+
+    fn missing_in(issue: &str, comic: &str) -> ReconciledSnatch {
+        ReconciledSnatch {
+            issue_id: issue.into(),
+            comic_id: Some(comic.into()),
+            ..missing_row()
+        }
+    }
+
+    async fn comic_reads(server: &MockServer, id: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                let q: Vec<_> = r.url.query_pairs().collect();
+                q.iter().any(|(k, v)| k == "cmd" && v == "getComic")
+                    && q.iter().any(|(k, v)| k == "id" && v == id)
+            })
+            .count()
+    }
+
+    async fn mount_comic(server: &MockServer, id: &str, issue: &str) {
+        Mock::given(method("GET"))
+            .and(path("/api"))
+            .and(query_param("cmd", "getComic"))
+            .and(query_param("id", id))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"comic": [], "issues": [{"id": issue, "status": "Snatched"}], "annuals": []}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[test]
+    fn guard_reuses_series_already_read() {
+        crate::mock::run(async {
+            let mylar = MockServer::start().await;
+            mount_comic(&mylar, "a", "1").await;
+            mount_comic(&mylar, "b", "2").await;
+            let m = Mylar::new(&mylar.uri(), "KEY", None);
+            let known: status::SeriesIssues = [(
+                "a".to_string(),
+                vec![IssueState {
+                    id: Some("1".into()),
+                    number: None,
+                    status: Some("Snatched".into()),
+                }],
+            )]
+            .into();
+            let rows = [
+                missing_in("1", "a"),
+                missing_in("2", "b"),
+                missing_in("3", "b"),
+            ];
+            let g = still_snatched(&m, &rows, known, MAX_GUARD_LOOKUPS, String::new()).await;
+            assert_eq!(g.still_snatched, ["1".to_string(), "2".to_string()].into());
+            assert!(g.unchecked.is_empty());
+            assert_eq!(comic_reads(&mylar, "a").await, 0);
+            assert_eq!(comic_reads(&mylar, "b").await, 1);
+        })
+    }
+
+    #[test]
+    fn guard_past_its_lookup_cap_is_review() {
+        crate::mock::run(async {
+            let mylar = MockServer::start().await;
+            mount_comic(&mylar, "a", "1").await;
+            mount_comic(&mylar, "b", "2").await;
+            let m = Mylar::new(&mylar.uri(), "KEY", None);
+            let rows = [missing_in("1", "a"), missing_in("2", "b")];
+            let g = still_snatched(&m, &rows, status::SeriesIssues::new(), 1, guard().before).await;
+            assert_eq!(g.unchecked, ["b".to_string()].into());
+            assert_eq!(comic_reads(&mylar, "b").await, 0);
+            let a = actions(&rows, Some(&g));
+            assert_eq!(a[0].action, "fail");
+            assert_eq!(a[1].action, "review");
+            assert!(a[1].reason.as_deref().unwrap().contains("was not checked"));
         })
     }
 
