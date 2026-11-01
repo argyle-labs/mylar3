@@ -385,8 +385,11 @@ fn post_processing_findings(ini: &ConfigIni, pp: &PostProcessingCheck) -> Vec<St
 const MAX_UTC_OFFSET: Duration = Duration::from_secs(14 * 3600);
 
 pub fn earliest_mylar_local_time(t: Timestamp) -> String {
-    t.minus(MAX_UTC_OFFSET)
-        .to_rfc3339()
+    mylar_time(t.minus(MAX_UTC_OFFSET))
+}
+
+fn mylar_time(t: Timestamp) -> String {
+    t.to_rfc3339()
         .replacen('T', " ", 1)
         .trim_end_matches('Z')
         .to_string()
@@ -446,9 +449,7 @@ pub fn stuck_snatches(
     threshold_hours: u32,
     now: Timestamp,
 ) -> (Vec<&Snatch>, BTreeMap<&str, usize>) {
-    let before = earliest_mylar_local_time(
-        now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)),
-    );
+    let before = mylar_time(now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)));
     let mut latest: BTreeMap<&str, &Snatch> = BTreeMap::new();
     let mut grabs: BTreeMap<&str, usize> = BTreeMap::new();
     for s in history {
@@ -723,7 +724,7 @@ mod tests {
             snatch("1", "2026-09-02 10:00:00", "Snatched"),
             snatch("2", "2026-09-03 10:00:00", "Snatched"),
             snatch("2", "2026-09-03 11:00:00", "Post-Processed"),
-            snatch("3", "2026-10-04 20:00:00", "Snatched"),
+            snatch("3", "2026-10-05 09:00:00", "Snatched"),
         ];
         let s = build(
             "m",
@@ -743,6 +744,13 @@ mod tests {
         assert_eq!(s.stuck_snatched.sample[0].comic, "C1");
         let s = build("m", 0, &Wanted::default(), &history, Ok(ini(&[])), 1, now());
         assert_eq!(s.stuck_snatched.count, 2);
+    }
+
+    #[test]
+    fn grab_just_past_stuck_hours_is_stuck() {
+        let history = vec![snatch("1", "2026-10-04 11:59:59", "Snatched")];
+        let (stuck, _) = stuck_snatches(&history, 24, now());
+        assert_eq!(stuck.len(), 1);
     }
 
     #[test]
