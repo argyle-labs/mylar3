@@ -379,8 +379,14 @@ fn post_processing_findings(ini: &ConfigIni, pp: &PostProcessingCheck) -> Vec<St
     out
 }
 
-pub fn utc_as_mylar_local_time(t: Timestamp) -> String {
-    t.to_rfc3339()
+/// Mylar stores `DateAdded` in its host's local time and its API exposes no timezone, so the
+/// cutoff is shifted back by the largest UTC offset (+14h): anything older than the result is older
+/// than `t` in every timezone.
+const MAX_UTC_OFFSET: Duration = Duration::from_secs(14 * 3600);
+
+pub fn earliest_mylar_local_time(t: Timestamp) -> String {
+    t.minus(MAX_UTC_OFFSET)
+        .to_rfc3339()
         .replacen('T', " ", 1)
         .trim_end_matches('Z')
         .to_string()
@@ -440,8 +446,9 @@ pub fn stuck_snatches(
     threshold_hours: u32,
     now: Timestamp,
 ) -> (Vec<&Snatch>, BTreeMap<&str, usize>) {
-    let before =
-        utc_as_mylar_local_time(now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)));
+    let before = earliest_mylar_local_time(
+        now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)),
+    );
     let mut latest: BTreeMap<&str, &Snatch> = BTreeMap::new();
     let mut grabs: BTreeMap<&str, usize> = BTreeMap::new();
     for s in history {
@@ -572,6 +579,25 @@ mod tests {
         Timestamp::parse_rfc3339("2026-10-05T12:00:00Z").unwrap()
     }
 
+    #[test]
+    fn mylar_cutoff_is_shifted_back_by_the_largest_utc_offset() {
+        assert_eq!(earliest_mylar_local_time(now()), "2026-10-04 22:00:00");
+    }
+
+    #[test]
+    fn mylar_cutoff_precedes_the_instant_in_every_timezone() {
+        let cutoff = earliest_mylar_local_time(now());
+        for hours in -12i64..=14 {
+            let local = Timestamp::from_unix_seconds(now().unix_seconds() + hours * 3600)
+                .unwrap()
+                .to_rfc3339()
+                .replacen('T', " ", 1)
+                .trim_end_matches('Z')
+                .to_string();
+            assert!(cutoff <= local, "offset {hours}h: {cutoff} > {local}");
+        }
+    }
+
     fn ini(pairs: &[(&str, &str)]) -> ConfigIni {
         ConfigIni(
             pairs
@@ -697,7 +723,7 @@ mod tests {
             snatch("1", "2026-09-02 10:00:00", "Snatched"),
             snatch("2", "2026-09-03 10:00:00", "Snatched"),
             snatch("2", "2026-09-03 11:00:00", "Post-Processed"),
-            snatch("3", "2026-10-05 09:00:00", "Snatched"),
+            snatch("3", "2026-10-04 20:00:00", "Snatched"),
         ];
         let s = build(
             "m",

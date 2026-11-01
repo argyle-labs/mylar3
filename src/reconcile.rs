@@ -292,8 +292,8 @@ pub async fn resolve(
     let now = Timestamp::now();
     let classified = inputs.classify(name, stuck_hours, now);
     let (summary, stuck) = every_stuck(RESOLVE_CAP, |page| classified.page(page))?;
-    let before = status::utc_as_mylar_local_time(
-        Timestamp::now().minus(Duration::from_secs(u64::from(missing_after_days) * 86_400)),
+    let before = status::earliest_mylar_local_time(
+        now.minus(Duration::from_secs(u64::from(missing_after_days) * 86_400)),
     );
     let guard = if include_missing {
         still_snatched(m, &stuck, inputs.series, MAX_GUARD_LOOKUPS, before).await
