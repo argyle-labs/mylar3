@@ -1,6 +1,6 @@
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::time::Timestamp;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::api::{ConfigIni, Mylar, Snatch};
@@ -110,8 +110,8 @@ async fn fetch(m: &Mylar, stuck_hours: u32) -> Result<Inputs> {
 }
 
 impl Inputs {
-    fn build(&self, name: &str, stuck_hours: u32, now: Timestamp, page: Page) -> ReconcileReport {
-        build(
+    fn classify(&self, name: &str, stuck_hours: u32, now: Timestamp) -> Classified {
+        classify_all(
             name,
             &self.sab_host,
             &self.category,
@@ -120,7 +120,6 @@ impl Inputs {
             &self.slots,
             stuck_hours,
             now,
-            page,
         )
     }
 }
@@ -133,7 +132,9 @@ pub async fn reconcile(
     limit: usize,
 ) -> Result<ReconcileReport> {
     let inputs = fetch(m, stuck_hours).await?;
-    Ok(inputs.build(name, stuck_hours, Timestamp::now(), Page { offset, limit }))
+    Ok(inputs
+        .classify(name, stuck_hours, Timestamp::now())
+        .page(Page { offset, limit }))
 }
 
 /// Pages `page_fn` until every stuck grab is read; errors when the total exceeds `cap`.
@@ -269,9 +270,8 @@ pub async fn resolve(
 ) -> Result<ResolveReport> {
     let inputs = fetch(m, stuck_hours).await?;
     let now = Timestamp::now();
-    let (summary, stuck) = every_stuck(RESOLVE_CAP, |page| {
-        inputs.build(name, stuck_hours, now, page)
-    })?;
+    let classified = inputs.classify(name, stuck_hours, now);
+    let (summary, stuck) = every_stuck(RESOLVE_CAP, |page| classified.page(page))?;
     let before = status::utc_as_mylar_local_time(
         Timestamp::now().minus(Duration::from_secs(u64::from(missing_after_days) * 86_400)),
     );
@@ -365,6 +365,145 @@ impl Default for Page {
     }
 }
 
+/// Every stuck grab classified once; pages slice it.
+pub struct Classified {
+    name: String,
+    threshold_hours: u32,
+    sab_host: String,
+    sab_category: String,
+    sab_history_entries: usize,
+    sab_queue_entries: usize,
+    summary: ReconcileSummary,
+    rows: Vec<ReconciledSnatch>,
+}
+
+impl Classified {
+    pub fn page(&self, page: Page) -> ReconcileReport {
+        let limit = page.limit.clamp(1, MAX_LIMIT);
+        let rows: Vec<ReconciledSnatch> = self
+            .rows
+            .iter()
+            .skip(page.offset)
+            .take(limit)
+            .cloned()
+            .collect();
+        let truncated = page.offset + rows.len() < self.summary.total;
+        ReconcileReport {
+            name: self.name.clone(),
+            threshold_hours: self.threshold_hours,
+            sab_host: self.sab_host.clone(),
+            sab_category: self.sab_category.clone(),
+            sab_history_entries: self.sab_history_entries,
+            sab_queue_entries: self.sab_queue_entries,
+            summary: self.summary.clone(),
+            offset: page.offset,
+            limit,
+            truncated,
+            rows,
+        }
+    }
+}
+
+/// SAB queue then history slots, tokenized once, with token and nzo_id postings in slot order.
+struct SlotIndex<'a> {
+    named: Vec<(Vec<String>, &'a HistorySlot)>,
+    by_token: HashMap<String, Vec<usize>>,
+    by_nzo: HashMap<&'a str, Vec<usize>>,
+}
+
+impl<'a> SlotIndex<'a> {
+    fn new(queue: &'a [HistorySlot], slots: &'a [HistorySlot]) -> Self {
+        let named: Vec<(Vec<String>, &HistorySlot)> = queue
+            .iter()
+            .chain(slots)
+            .map(|s| (tokens(slot_name(s)), s))
+            .collect();
+        let mut by_token: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_nzo: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, (t, slot)) in named.iter().enumerate() {
+            if let Some(id) = slot.nzo_id.as_deref() {
+                by_nzo.entry(id).or_default().push(i);
+            }
+            for tok in t {
+                let list = by_token.entry(tok.clone()).or_default();
+                if list.last() != Some(&i) {
+                    list.push(i);
+                }
+            }
+        }
+        SlotIndex {
+            named,
+            by_token,
+            by_nzo,
+        }
+    }
+
+    fn by_nzo(&self, id: &str) -> Vec<&'a HistorySlot> {
+        self.by_nzo
+            .get(id)
+            .map(|ids| ids.iter().map(|&i| self.named[i].1).collect())
+            .unwrap_or_default()
+    }
+
+    /// Slots whose name carries every comic token, in slot order.
+    fn series(&self, comic: &[String]) -> Vec<&(Vec<String>, &'a HistorySlot)> {
+        let Some(rarest) = comic
+            .iter()
+            .map(|c| self.by_token.get(c).map_or(&[][..], Vec::as_slice))
+            .min_by_key(|ids| ids.len())
+        else {
+            return Vec::new();
+        };
+        rarest
+            .iter()
+            .map(|&i| &self.named[i])
+            .filter(|(t, _)| comic.iter().all(|c| t.contains(c)))
+            .collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn classify_all(
+    name: &str,
+    sab_host: &str,
+    category: &str,
+    history: &[Snatch],
+    queue: &[HistorySlot],
+    slots: &[HistorySlot],
+    stuck_hours: u32,
+    now: Timestamp,
+) -> Classified {
+    let (stuck, grabs) = status::stuck_snatches(history, stuck_hours, now);
+    let index = SlotIndex::new(queue, slots);
+    let mut summary = ReconcileSummary::default();
+    let rows: Vec<ReconciledSnatch> = stuck
+        .into_iter()
+        .map(|s| {
+            let id = s.issue_id.as_deref().unwrap_or_default();
+            let row = classify(s, grabs.get(id).copied().unwrap_or_default(), &index);
+            summary.total += 1;
+            match row.class.as_str() {
+                "sab_completed" => summary.sab_completed += 1,
+                "sab_failed" => summary.sab_failed += 1,
+                "sab_pending" => summary.sab_pending += 1,
+                "name_mismatch" => summary.name_mismatch += 1,
+                _ => summary.sab_missing += 1,
+            }
+            row
+        })
+        .collect();
+    Classified {
+        name: name.to_string(),
+        threshold_hours: stuck_hours,
+        sab_host: sab_host.to_string(),
+        sab_category: category.to_string(),
+        sab_history_entries: slots.len(),
+        sab_queue_entries: queue.len(),
+        summary,
+        rows,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     name: &str,
@@ -377,48 +516,17 @@ pub fn build(
     now: Timestamp,
     page: Page,
 ) -> ReconcileReport {
-    let limit = page.limit.clamp(1, MAX_LIMIT);
-    let (stuck, grabs) = status::stuck_snatches(history, stuck_hours, now);
-    let named: Vec<(Vec<String>, &HistorySlot)> = queue
-        .iter()
-        .chain(slots)
-        .map(|s| (tokens(slot_name(s)), s))
-        .collect();
-    let mut summary = ReconcileSummary::default();
-    let rows: Vec<ReconciledSnatch> = stuck
-        .into_iter()
-        .map(|s| {
-            let id = s.issue_id.as_deref().unwrap_or_default();
-            let row = classify(s, grabs.get(id).copied().unwrap_or_default(), &named);
-            summary.total += 1;
-            match row.class.as_str() {
-                "sab_completed" => summary.sab_completed += 1,
-                "sab_failed" => summary.sab_failed += 1,
-                "sab_pending" => summary.sab_pending += 1,
-                "name_mismatch" => summary.name_mismatch += 1,
-                _ => summary.sab_missing += 1,
-            }
-            row
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .skip(page.offset)
-        .take(limit)
-        .collect();
-    let truncated = page.offset + rows.len() < summary.total;
-    ReconcileReport {
-        name: name.to_string(),
-        threshold_hours: stuck_hours,
-        sab_host: sab_host.to_string(),
-        sab_category: category.to_string(),
-        sab_history_entries: slots.len(),
-        sab_queue_entries: queue.len(),
-        summary,
-        offset: page.offset,
-        limit,
-        truncated,
-        rows,
-    }
+    classify_all(
+        name,
+        sab_host,
+        category,
+        history,
+        queue,
+        slots,
+        stuck_hours,
+        now,
+    )
+    .page(page)
 }
 
 fn slot_name(s: &HistorySlot) -> &str {
@@ -428,7 +536,7 @@ fn slot_name(s: &HistorySlot) -> &str {
         .unwrap_or_default()
 }
 
-fn classify(s: &Snatch, grabs: usize, named: &[(Vec<String>, &HistorySlot)]) -> ReconciledSnatch {
+fn classify(s: &Snatch, grabs: usize, index: &SlotIndex) -> ReconciledSnatch {
     let nzo_id = s
         .hash
         .clone()
@@ -438,18 +546,9 @@ fn classify(s: &Snatch, grabs: usize, named: &[(Vec<String>, &HistorySlot)]) -> 
     let comic_tokens = series_tokens(&comic);
     let by_id: Vec<&HistorySlot> = nzo_id
         .as_deref()
-        .map(|id| {
-            named
-                .iter()
-                .filter(|(_, slot)| slot.nzo_id.as_deref() == Some(id))
-                .map(|(_, slot)| *slot)
-                .collect()
-        })
+        .map(|id| index.by_nzo(id))
         .unwrap_or_default();
-    let series: Vec<&(Vec<String>, &HistorySlot)> = named
-        .iter()
-        .filter(|(t, _)| !comic_tokens.is_empty() && comic_tokens.iter().all(|c| t.contains(c)))
-        .collect();
+    let series = index.series(&comic_tokens);
     let by_name: Vec<&HistorySlot> = series
         .iter()
         .filter(|(t, _)| issue_matches(&issue, t) && same_series(&comic_tokens, &issue, t))
@@ -1129,6 +1228,36 @@ mod tests {
         assert_eq!((summary.total, rows.len(), pages), (2_345, 2_345, 3));
         let ids: HashSet<&str> = rows.iter().map(|r| r.issue_id.as_str()).collect();
         assert_eq!(ids.len(), 2_345);
+    }
+
+    #[test]
+    fn classification_scales_to_thousands_of_grabs_and_slots() {
+        let at = old();
+        let history: Vec<Snatch> = (0..5_000)
+            .map(|i| snatch(&i.to_string(), &format!("Series{i}"), "1", &at, None))
+            .collect();
+        let slots: Vec<HistorySlot> = (0..20_000)
+            .map(|i| {
+                slot(
+                    &format!("n{i}"),
+                    &format!("Series{i} 001 (2020)"),
+                    "Failed",
+                    i,
+                )
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let classified = classify_all("m", "h", "comics", &history, &[], &slots, 24, now());
+        let (summary, rows) = every_stuck(RESOLVE_CAP, |page| classified.page(page)).unwrap();
+        assert_eq!(
+            (summary.total, summary.sab_failed, rows.len()),
+            (5_000, 5_000, 5_000)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
