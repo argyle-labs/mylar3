@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::time::Timestamp;
 
-use crate::api::{ConfigIni, Mylar, Snatch, Wanted, WantedIssue};
+use crate::api::{ConfigIni, IssueState, Mylar, Snatch, Wanted, WantedIssue};
 
 const KEYS: &[&str] = &[
     "usenet_retention",
@@ -24,6 +24,7 @@ const KEYS: &[&str] = &[
     "enable_torrent_search",
     "enable_torznab",
     "torrent_downloader",
+    "failed_download_handling",
 ];
 
 const STUCK_SAMPLE: usize = 10;
@@ -44,6 +45,8 @@ pub struct RetentionCheck {
     pub wanted_before_cutoff: Option<usize>,
     /// The cutoff hides at least one Wanted issue.
     pub drift: Option<bool>,
+    /// Smallest retention, in days, whose cutoff reaches `oldest_wanted_date`.
+    pub covering_days: Option<i64>,
 }
 
 #[orca_struct]
@@ -176,24 +179,46 @@ pub fn build(
     if retention.drift == Some(true) {
         findings.push(format!(
             "usenet_retention={} sends maxage={} so indexers drop posts before {}; {} of {} \
-             dated Wanted issues were released before that",
+             dated Wanted issues were released before that; mylar3.configure raises it to {} \
+             (--dry-run previews)",
             retention.usenet_retention_days.unwrap_or_default(),
             retention.usenet_retention_days.unwrap_or_default(),
             retention.cutoff_date.as_deref().unwrap_or("?"),
             retention.wanted_before_cutoff.unwrap_or_default(),
             retention.wanted_dated,
+            retention.covering_days.unwrap_or_default(),
         ));
     }
     findings.extend(post_processing_findings(&ini, &post_processing));
     if stuck_snatched.count > 0 {
         findings.push(format!(
-            "{} issues stuck at Snatched for more than {}h (oldest {}); {} issues grabbed \
-             more than once",
+            "{} issues stuck at Snatched for more than {}h (oldest {}); \
+             mylar3.snatched.resolve fails the dead grabs",
             stuck_snatched.count,
             stuck_hours,
             stuck_snatched.oldest.as_deref().unwrap_or("?"),
+        ));
+    }
+    if stuck_snatched.repeat_grabbed > 0 {
+        let cause = if ini.flag("failed_download_handling") == Some(false) {
+            "failed_download_handling is off, so Mylar keeps no failed list and re-grabs the \
+             same release; mylar3.configure turns it on (--dry-run \
+             previews)"
+        } else {
+            "earlier grabs never imported and were not failed, so their releases stay \
+             eligible; mylar3.snatched.resolve fails them"
+        };
+        findings.push(format!(
+            "{} issues grabbed more than once: {cause}",
             stuck_snatched.repeat_grabbed,
         ));
+    }
+    if ini.flag("failed_download_handling") == Some(false) && stuck_snatched.repeat_grabbed == 0 {
+        findings.push(
+            "failed_download_handling is off: a failed download leaves the release eligible \
+             and Mylar grabs it again"
+                .into(),
+        );
     }
     if search.search_delay_valid == Some(false) {
         findings.push(format!(
@@ -226,7 +251,7 @@ pub fn build(
     }
 }
 
-fn issue_date(i: &WantedIssue) -> Option<String> {
+pub fn issue_date(i: &WantedIssue) -> Option<String> {
     [&i.release_date, &i.issue_date]
         .into_iter()
         .flatten()
@@ -252,11 +277,31 @@ fn retention(ini: &ConfigIni, issues: &[&WantedIssue], now: Timestamp) -> Retent
     RetentionCheck {
         usenet_retention_days: days,
         drift: wanted_before_cutoff.map(|n| n > 0),
+        covering_days: oldest_wanted_date
+            .as_deref()
+            .and_then(|d| covering_days(d, now)),
         cutoff_date,
         oldest_wanted_date,
         wanted_dated: dates.len(),
         wanted_before_cutoff,
     }
+}
+
+/// Days back from `now` to the start of `date` (`YYYY-MM-DD`, a `00` month or day read as `01`), plus one so the cutoff lands before it.
+pub fn covering_days(date: &str, now: Timestamp) -> Option<i64> {
+    let mut parts = date.splitn(3, '-');
+    let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
+    let unzero = |p: &str| {
+        if p == "00" {
+            "01".to_string()
+        } else {
+            p.to_string()
+        }
+    };
+    let day =
+        Timestamp::parse_rfc3339(&format!("{y}-{}-{}T00:00:00Z", unzero(m), unzero(d))).ok()?;
+    let secs = now.unix_seconds() - day.unix_seconds();
+    (secs >= 0).then(|| (secs + 86_399) / 86_400 + 1)
 }
 
 fn nzb_downloader_name(v: i64) -> String {
@@ -334,12 +379,23 @@ fn post_processing_findings(ini: &ConfigIni, pp: &PostProcessingCheck) -> Vec<St
     out
 }
 
-fn utc_as_mylar_local_time(t: Timestamp) -> String {
+/// Mylar stores `DateAdded` in its host's local time and its API exposes no timezone, so the
+/// cutoff is shifted back by the most negative UTC offset (UTC-12), the earliest any local clock reads.
+const MAX_NEGATIVE_UTC_OFFSET: Duration = Duration::from_secs(12 * 3600);
+
+pub fn earliest_mylar_local_time(t: Timestamp) -> String {
+    mylar_time(t.minus(MAX_NEGATIVE_UTC_OFFSET))
+}
+
+fn mylar_time(t: Timestamp) -> String {
     t.to_rfc3339()
         .replacen('T', " ", 1)
         .trim_end_matches('Z')
         .to_string()
 }
+
+/// Issues and annuals of each series read, keyed by comic id.
+pub type SeriesIssues = HashMap<String, Vec<IssueState>>;
 
 pub async fn current(
     m: &Mylar,
@@ -347,6 +403,15 @@ pub async fn current(
     stuck_hours: u32,
     now: Timestamp,
 ) -> Result<Vec<Snatch>> {
+    Ok(current_with_series(m, history, stuck_hours, now).await?.0)
+}
+
+pub async fn current_with_series(
+    m: &Mylar,
+    history: Vec<Snatch>,
+    stuck_hours: u32,
+    now: Timestamp,
+) -> Result<(Vec<Snatch>, SeriesIssues)> {
     let mut seen = BTreeSet::new();
     let comics: Vec<String> = stuck_snatches(&history, stuck_hours, now)
         .0
@@ -356,17 +421,19 @@ pub async fn current(
         .take(MAX_SERIES_LOOKUPS)
         .collect();
     let mut moved_on = BTreeSet::new();
+    let mut series = SeriesIssues::new();
     for id in comics {
         let c = m.comic(&id).await?;
+        let issues: Vec<IssueState> = c.issues.into_iter().chain(c.annuals).collect();
         moved_on.extend(
-            c.issues
-                .into_iter()
-                .chain(c.annuals)
+            issues
+                .iter()
                 .filter(|i| i.status.as_deref() != Some("Snatched"))
-                .filter_map(|i| i.id),
+                .filter_map(|i| i.id.clone()),
         );
+        series.insert(id, issues);
     }
-    Ok(drop_moved_on(history, &moved_on))
+    Ok((drop_moved_on(history, &moved_on), series))
 }
 
 fn drop_moved_on(history: Vec<Snatch>, moved_on: &BTreeSet<String>) -> Vec<Snatch> {
@@ -381,8 +448,7 @@ pub fn stuck_snatches(
     threshold_hours: u32,
     now: Timestamp,
 ) -> (Vec<&Snatch>, BTreeMap<&str, usize>) {
-    let before =
-        utc_as_mylar_local_time(now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)));
+    let before = mylar_time(now.minus(Duration::from_secs(u64::from(threshold_hours) * 3600)));
     let mut latest: BTreeMap<&str, &Snatch> = BTreeMap::new();
     let mut grabs: BTreeMap<&str, usize> = BTreeMap::new();
     for s in history {
@@ -513,6 +579,25 @@ mod tests {
         Timestamp::parse_rfc3339("2026-10-05T12:00:00Z").unwrap()
     }
 
+    #[test]
+    fn mylar_cutoff_is_shifted_back_by_the_most_negative_utc_offset() {
+        assert_eq!(earliest_mylar_local_time(now()), "2026-10-05 00:00:00");
+    }
+
+    #[test]
+    fn mylar_cutoff_precedes_the_instant_in_every_timezone() {
+        let cutoff = earliest_mylar_local_time(now());
+        for hours in -12i64..=14 {
+            let local = Timestamp::from_unix_seconds(now().unix_seconds() + hours * 3600)
+                .unwrap()
+                .to_rfc3339()
+                .replacen('T', " ", 1)
+                .trim_end_matches('Z')
+                .to_string();
+            assert!(cutoff <= local, "offset {hours}h: {cutoff} > {local}");
+        }
+    }
+
     fn ini(pairs: &[(&str, &str)]) -> ConfigIni {
         ConfigIni(
             pairs
@@ -575,7 +660,19 @@ mod tests {
         assert_eq!(s.retention.drift, Some(true));
         assert_eq!(s.wanted, 4);
         assert!(s.findings.iter().any(|f| f.contains("maxage=3500")));
+        assert_eq!(s.retention.covering_days, Some(10141));
         assert!(!s.healthy);
+
+        let s = build(
+            "m",
+            3,
+            &wanted,
+            &[],
+            Ok(ini(&[("usenet_retention", "10141")])),
+            24,
+            now(),
+        );
+        assert_eq!(s.retention.drift, Some(false));
 
         let s = build(
             "m",
@@ -587,6 +684,14 @@ mod tests {
             now(),
         );
         assert_eq!(s.retention.drift, Some(false));
+    }
+
+    #[test]
+    fn covering_days_reaches_the_date() {
+        assert_eq!(covering_days("2026-10-05", now()), Some(2));
+        assert_eq!(covering_days("2026-10-04", now()), Some(3));
+        assert_eq!(covering_days("2027-01-01", now()), None);
+        assert_eq!(covering_days("garbage", now()), None);
     }
 
     #[test]
@@ -638,6 +743,50 @@ mod tests {
         assert_eq!(s.stuck_snatched.sample[0].comic, "C1");
         let s = build("m", 0, &Wanted::default(), &history, Ok(ini(&[])), 1, now());
         assert_eq!(s.stuck_snatched.count, 2);
+    }
+
+    #[test]
+    fn grab_just_past_stuck_hours_is_stuck() {
+        let history = vec![snatch("1", "2026-10-04 11:59:59", "Snatched")];
+        let (stuck, _) = stuck_snatches(&history, 24, now());
+        assert_eq!(stuck.len(), 1);
+    }
+
+    #[test]
+    fn repeat_grabs_are_a_finding_and_name_failed_handling() {
+        let history = vec![
+            snatch("1", "2026-10-05 08:00:00", "Snatched"),
+            snatch("1", "2026-10-05 09:00:00", "Snatched"),
+        ];
+        let at = |fdh: &str| {
+            build(
+                "m",
+                0,
+                &Wanted::default(),
+                &history,
+                Ok(ini(&[("failed_download_handling", fdh)])),
+                24,
+                now(),
+            )
+        };
+        let s = at("False");
+        assert_eq!(s.stuck_snatched.count, 0);
+        assert_eq!(s.findings.len(), 1, "{:?}", s.findings);
+        assert!(s.findings[0].contains("1 issues grabbed more than once"));
+        assert!(s.findings[0].contains("failed_download_handling is off"));
+        let s = at("True");
+        assert_eq!(s.findings.len(), 1, "{:?}", s.findings);
+        assert!(s.findings[0].contains("not failed"));
+        let s = build(
+            "m",
+            0,
+            &Wanted::default(),
+            &[],
+            Ok(ini(&[("failed_download_handling", "False")])),
+            24,
+            now(),
+        );
+        assert!(s.findings[0].starts_with("failed_download_handling is off"));
     }
 
     #[test]

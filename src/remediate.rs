@@ -3,7 +3,7 @@ use plugin_toolkit::scrub;
 use plugin_toolkit::time::Timestamp;
 
 use crate::acquisition::{self, Protocol, ResolvedDownloadClient};
-use crate::api::{ConfigIni, Mylar};
+use crate::api::{ConfigIni, Mylar, Wanted};
 use crate::definitions::CONFIG_KEYS;
 use crate::{secret, status};
 
@@ -164,16 +164,27 @@ pub struct ConfigureReport {
     pub dry_run: bool,
 }
 
-pub fn plan(ini: &ConfigIni, usenet_retention: Option<u32>) -> (Vec<SettingChange>, Vec<String>) {
+/// `floor` is the retention the Wanted list needs, never below `DEFAULT_USENET_RETENTION`.
+pub fn plan(
+    ini: &ConfigIni,
+    usenet_retention: Option<u32>,
+    floor: u32,
+) -> (Vec<SettingChange>, Vec<String>) {
     let mut changes = Vec::new();
     let mut manual = Vec::new();
     let current = ini.int("usenet_retention");
     let target = match usenet_retention {
         Some(t) => (current != Some(i64::from(t))).then_some(t),
         None => current
-            .is_none_or(|c| c < i64::from(DEFAULT_USENET_RETENTION))
-            .then_some(DEFAULT_USENET_RETENTION),
+            .is_none_or(|c| c < i64::from(floor))
+            .then_some(floor),
     };
+    if let Some(t) = usenet_retention.filter(|t| *t < floor) {
+        manual.push(format!(
+            "usenet_retention={t} hides Wanted issues released before its cutoff; {floor} \
+             reaches the oldest"
+        ));
+    }
     if let Some(target) = target {
         changes.push(SettingChange {
             key: "usenet_retention".into(),
@@ -205,6 +216,20 @@ pub fn plan(ini: &ConfigIni, usenet_retention: Option<u32>) -> (Vec<SettingChang
         }
     }
     (changes, manual)
+}
+
+pub fn retention_floor(wanted: &Wanted, now: Timestamp) -> u32 {
+    wanted
+        .issues
+        .iter()
+        .chain(&wanted.annuals)
+        .filter_map(status::issue_date)
+        .min()
+        .and_then(|d| status::covering_days(&d, now))
+        .and_then(|d| u32::try_from(d).ok())
+        .map_or(DEFAULT_USENET_RETENTION, |d| {
+            d.max(DEFAULT_USENET_RETENTION)
+        })
 }
 
 pub fn plan_toggles(ini: &ConfigIni, toggles: &[(&str, bool)]) -> Vec<SettingChange> {
@@ -415,8 +440,36 @@ pub async fn configure(
         .config()
         .await
         .context("read Mylar's settings to plan configure")?;
-    let (mut changes, manual) = plan(&before, usenet_retention);
+    let wanted = m
+        .wanted()
+        .await
+        .context("read Mylar's Wanted list to size usenet_retention")?;
+    let floor = retention_floor(&wanted, Timestamp::now());
+    let (mut changes, mut manual) = plan(&before, usenet_retention, floor);
+    let explicit = toggles
+        .iter()
+        .any(|(k, _)| *k == "failed_download_handling");
+    let mut toggles = toggles.to_vec();
+    if !explicit {
+        toggles.push(("failed_download_handling", true));
+    }
+    let toggles = toggles.as_slice();
     changes.extend(plan_toggles(&before, toggles));
+    if !explicit {
+        for c in changes
+            .iter_mut()
+            .filter(|c| c.key == "failed_download_handling")
+        {
+            c.reason = "off, Mylar keeps no failed list and re-grabs the same release after a \
+                        failed download"
+                .into();
+            manual.push(
+                "failed_download_handling was off in Mylar; orca turned it on (repeat-grab \
+                 guard). Pass --failed-download-handling false to keep it off."
+                    .into(),
+            );
+        }
+    }
     let mut posted = changes.clone();
     if let Some(client) = torrent {
         let (shown, values) = plan_torrent(&before, client)?;
@@ -469,7 +522,7 @@ pub async fn configure(
         .config()
         .await
         .context("settings were submitted; re-read to verify failed")?;
-    let mut drift = plan(&after, usenet_retention).0;
+    let mut drift = plan(&after, usenet_retention, floor).0;
     drift.extend(plan_toggles(&after, toggles));
     if let Some(client) = torrent {
         drift.extend(plan_torrent(&after, client)?.0);
@@ -637,6 +690,7 @@ mod tests {
             .collect();
         for (k, v) in [
             ("minimal_ini", "False"),
+            ("failed_download_handling", "True"),
             ("usenet_retention", "3500"),
             ("newznab", "True"),
             ("post_processing", "True"),
@@ -708,6 +762,12 @@ mod tests {
                 "success": true,
                 "data": [{"IssueID": "1", "DateAdded": "2020-01-01 00:00:00", "Status": "Snatched"}]
             })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api"))
+            .and(query_param("cmd", "getWanted"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issues": []})))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -865,11 +925,8 @@ mod tests {
                 .to_string();
             assert!(err.contains("api_enabled: True -> False"), "{err}");
             assert!(err.contains("api_enabled=True"), "{err}");
-            assert!(
-                err.contains("sab_apikey: <redacted> -> <redacted>"),
-                "{err}"
-            );
-            assert!(err.contains("gotify_token: <redacted>"), "{err}");
+            assert!(err.contains("sab_apikey: *** -> ***"), "{err}");
+            assert!(err.contains("gotify_token: ***"), "{err}");
             for secret in ["SABKEY", "LEAKED", "GTOKEN", "GLEAK"] {
                 assert!(!err.contains(secret), "{secret} in {err}");
             }
@@ -1216,13 +1273,114 @@ mod tests {
     #[test]
     fn retention_only_raises_unless_explicit() {
         let at = |v: &str| ini(&table(&[("usenet_retention", v)]));
-        assert!(plan(&at("12000"), None).0.is_empty());
-        assert_eq!(plan(&at("3500"), None).0[0].target, "6000");
-        assert_eq!(plan(&at("12000"), Some(4000)).0[0].target, "4000");
-        assert!(plan(&at("4000"), Some(4000)).0.is_empty());
+        assert!(plan(&at("12000"), None, DEFAULT_USENET_RETENTION)
+            .0
+            .is_empty());
+        assert_eq!(
+            plan(&at("3500"), None, DEFAULT_USENET_RETENTION).0[0].target,
+            "6000"
+        );
+        assert_eq!(
+            plan(&at("12000"), Some(4000), DEFAULT_USENET_RETENTION).0[0].target,
+            "4000"
+        );
+        assert!(plan(&at("4000"), Some(4000), DEFAULT_USENET_RETENTION)
+            .0
+            .is_empty());
         let mut rows = table(&[]);
         unset(&mut rows, "usenet_retention");
-        assert_eq!(plan(&ini(&rows), None).0[0].target, "6000");
+        assert_eq!(
+            plan(&ini(&rows), None, DEFAULT_USENET_RETENTION).0[0].target,
+            "6000"
+        );
+    }
+
+    #[test]
+    fn retention_floor_covers_the_oldest_wanted() {
+        let now = Timestamp::parse_rfc3339("2026-10-05T12:00:00Z").unwrap();
+        let issue = |d: &str| crate::api::WantedIssue {
+            comic_name: None,
+            issue_number: None,
+            release_date: Some(d.into()),
+            issue_date: None,
+            comic_id: None,
+            issue_id: None,
+        };
+        let w = |dates: &[&str]| Wanted {
+            issues: dates.iter().map(|d| issue(d)).collect(),
+            annuals: vec![],
+        };
+        assert_eq!(retention_floor(&w(&[]), now), DEFAULT_USENET_RETENTION);
+        assert_eq!(
+            retention_floor(&w(&["2020-01-01"]), now),
+            DEFAULT_USENET_RETENTION
+        );
+        assert_eq!(
+            retention_floor(&w(&["2020-01-01", "1999-01-01"]), now),
+            10141
+        );
+        let at6000 = ini(&table(&[("usenet_retention", "6000")]));
+        let (c, manual) = plan(&at6000, None, 10141);
+        assert_eq!(c[0].target, "10141");
+        assert!(manual.is_empty());
+        let (c, manual) = plan(&at6000, Some(7000), 10141);
+        assert_eq!(c[0].target, "7000");
+        assert!(manual[0].contains("10141"), "{manual:?}");
+    }
+
+    #[test]
+    fn configure_turns_on_failed_handling_unless_told_otherwise() {
+        crate::mock::run(async {
+            let rows = table(&[
+                ("usenet_retention", "6000"),
+                ("failed_download_handling", "False"),
+            ]);
+            let server = server(&[rows], ok()).await;
+            let r = configure("m", &mylar(&server), None, None, &[], false)
+                .await
+                .unwrap();
+            assert_eq!(r.changes.len(), 1);
+            assert_eq!(r.changes[0].key, "failed_download_handling");
+            assert_eq!(r.changes[0].target, "True");
+            assert!(
+                r.changes[0].reason.contains("re-grabs"),
+                "{:?}",
+                r.changes[0]
+            );
+            assert_eq!(r.manual.len(), 1, "{:?}", r.manual);
+            assert!(
+                r.manual[0].contains("--failed-download-handling false"),
+                "{:?}",
+                r.manual
+            );
+            let r = configure(
+                "m",
+                &mylar(&server),
+                None,
+                None,
+                &[("failed_download_handling", false)],
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(r.in_sync, "{:?}", r.changes);
+        })
+    }
+
+    #[test]
+    fn configure_adds_no_failed_handling_note_when_already_on() {
+        crate::mock::run(async {
+            let rows = table(&[
+                ("usenet_retention", "6000"),
+                ("failed_download_handling", "True"),
+            ]);
+            let server = server(&[rows], ok()).await;
+            let r = configure("m", &mylar(&server), None, None, &[], false)
+                .await
+                .unwrap();
+            assert!(r.manual.is_empty(), "{:?}", r.manual);
+            assert!(r.in_sync, "{:?}", r.changes);
+        })
     }
 
     #[test]
@@ -1244,7 +1402,7 @@ mod tests {
             for (k, v) in extra {
                 set(&mut rows, k, v);
             }
-            plan(&ini(&rows), None)
+            plan(&ini(&rows), None, DEFAULT_USENET_RETENTION)
         };
         let (changes, manual) = with(&[]);
         assert_eq!(changes[0].key, "nzb_downloader");
@@ -1375,10 +1533,7 @@ mod tests {
             "extra_newznabs",
             "sab_host",
         ] {
-            assert!(
-                d.contains(&format!("{key}: <redacted> -> <redacted>")),
-                "{key}: {d}"
-            );
+            assert!(d.contains(&format!("{key}: *** -> ***")), "{key}: {d}");
         }
         for leak in [
             "SABKEY",
@@ -1406,7 +1561,7 @@ mod tests {
         let rekeyed = ini(&table(&[("sab_apikey", "^~$z$S0VZMnNhbHRzYWx0")]));
         assert_eq!(
             diff(&before, &rekeyed, &[]),
-            vec!["sab_apikey: <redacted> -> <redacted>".to_string()]
+            vec!["sab_apikey: *** -> ***".to_string()]
         );
     }
 

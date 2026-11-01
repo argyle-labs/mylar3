@@ -543,8 +543,8 @@ impl Mylar {
         }
         let mut out = msg.to_string();
         for s in secrets.iter().filter(|s| !s.is_empty()) {
-            out = out.replace(s.as_str(), scrub::REDACTED_TEXT);
-            out = out.replace(&plugin_toolkit::url::encode(s), scrub::REDACTED_TEXT);
+            out = out.replace(s.as_str(), scrub::REDACTED);
+            out = out.replace(&plugin_toolkit::url::encode(s), scrub::REDACTED);
         }
         redact_query(&out, "apikey=")
     }
@@ -618,7 +618,7 @@ pub(crate) fn redact_query(msg: &str, marker: &str) -> String {
             .find(|c: char| matches!(c, '&' | ')' | '"' | '\'') || c.is_whitespace())
             .unwrap_or(tail.len());
         if end > 0 {
-            out.push_str(scrub::REDACTED_TEXT);
+            out.push_str(scrub::REDACTED);
         }
         rest = &tail[end..];
     }
