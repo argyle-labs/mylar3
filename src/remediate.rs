@@ -925,11 +925,8 @@ mod tests {
                 .to_string();
             assert!(err.contains("api_enabled: True -> False"), "{err}");
             assert!(err.contains("api_enabled=True"), "{err}");
-            assert!(
-                err.contains("sab_apikey: <redacted> -> <redacted>"),
-                "{err}"
-            );
-            assert!(err.contains("gotify_token: <redacted>"), "{err}");
+            assert!(err.contains("sab_apikey: *** -> ***"), "{err}");
+            assert!(err.contains("gotify_token: ***"), "{err}");
             for secret in ["SABKEY", "LEAKED", "GTOKEN", "GLEAK"] {
                 assert!(!err.contains(secret), "{secret} in {err}");
             }
@@ -1536,10 +1533,7 @@ mod tests {
             "extra_newznabs",
             "sab_host",
         ] {
-            assert!(
-                d.contains(&format!("{key}: <redacted> -> <redacted>")),
-                "{key}: {d}"
-            );
+            assert!(d.contains(&format!("{key}: *** -> ***")), "{key}: {d}");
         }
         for leak in [
             "SABKEY",
@@ -1567,7 +1561,7 @@ mod tests {
         let rekeyed = ini(&table(&[("sab_apikey", "^~$z$S0VZMnNhbHRzYWx0")]));
         assert_eq!(
             diff(&before, &rekeyed, &[]),
-            vec!["sab_apikey: <redacted> -> <redacted>".to_string()]
+            vec!["sab_apikey: *** -> ***".to_string()]
         );
     }
 

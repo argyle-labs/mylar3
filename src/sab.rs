@@ -162,11 +162,8 @@ impl Sab {
     fn redact(&self, msg: &str) -> String {
         let mut out = msg.to_string();
         if !self.api_key.is_empty() {
-            out = out.replace(self.api_key.as_str(), scrub::REDACTED_TEXT);
-            out = out.replace(
-                &plugin_toolkit::url::encode(&self.api_key),
-                scrub::REDACTED_TEXT,
-            );
+            out = out.replace(self.api_key.as_str(), scrub::REDACTED);
+            out = out.replace(&plugin_toolkit::url::encode(&self.api_key), scrub::REDACTED);
         }
         redact_query(&out, "apikey=")
     }

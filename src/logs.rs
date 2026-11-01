@@ -41,8 +41,8 @@ pub async fn logs(
 
 fn scrub_secrets(msg: &str, secrets: &[&str]) -> String {
     secrets.iter().fold(msg.to_string(), |out, s| {
-        out.replace(s, scrub::REDACTED_TEXT)
-            .replace(&plugin_toolkit::url::encode(s), scrub::REDACTED_TEXT)
+        out.replace(s, scrub::REDACTED)
+            .replace(&plugin_toolkit::url::encode(s), scrub::REDACTED)
     })
 }
 
