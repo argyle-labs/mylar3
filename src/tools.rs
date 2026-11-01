@@ -102,10 +102,6 @@ pub struct ResolveArgs {
     #[arg(long)]
     #[serde(default)]
     pub include_missing: bool,
-    /// Fail the releases; omitted, only reports what would be failed.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
 /// Fail each stuck Snatched grab SABnzbd reports failed, so Mylar skips that release; completed ones are listed for `mylar3.backlog.process`.
@@ -113,7 +109,8 @@ pub struct ResolveArgs {
     domain = "mylar3",
     verb = "snatched.resolve",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn mylar3_snatched_resolve(args: ResolveArgs, ctx: &ToolCtx) -> Result<ResolveReport> {
     execute::require_admin("mylar3.snatched.resolve", ctx)?;
@@ -123,7 +120,7 @@ async fn mylar3_snatched_resolve(args: ResolveArgs, ctx: &ToolCtx) -> Result<Res
         &m,
         args.stuck_hours,
         args.include_missing,
-        args.execute,
+        !ctx.dry_run(),
     )
     .await
 }
@@ -186,7 +183,7 @@ pub struct ConfigureArgs {
     #[arg(long)]
     #[serde(default)]
     pub torrent_username: Option<String>,
-    /// orca secret holding the torrent client password, read only on `execute`; defaults to `mylar3.torrent_password`.
+    /// orca secret holding the torrent client password, not read on a dry run; defaults to `mylar3.torrent_password`.
     #[arg(long)]
     #[serde(default)]
     pub torrent_password_secret: Option<String>,
@@ -206,10 +203,6 @@ pub struct ConfigureArgs {
     #[arg(long)]
     #[serde(default)]
     pub failed_auto: Option<bool>,
-    /// Apply the changes; omitted, only reports what would change.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
 /// Fix settings drift through Mylar's web settings form.
@@ -217,12 +210,14 @@ pub struct ConfigureArgs {
     domain = "mylar3",
     verb = "configure",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn mylar3_configure(args: ConfigureArgs, ctx: &ToolCtx) -> Result<ConfigureReport> {
     const TOOL: &str = "mylar3.configure";
     execute::require_admin(TOOL, ctx)?;
-    let torrent = torrent_client(&args, |name| {
+    let dry_run = ctx.dry_run();
+    let torrent = torrent_client(&args, dry_run, |name| {
         plugin_toolkit::secrets::get_required(name).map(|s| s.expose_secret().clone())
     })?;
     let toggles: Vec<(&str, bool)> = [
@@ -239,10 +234,10 @@ async fn mylar3_configure(args: ConfigureArgs, ctx: &ToolCtx) -> Result<Configur
         args.usenet_retention,
         torrent.as_ref().map(|(c, _)| c),
         &toggles,
-        args.execute,
+        !dry_run,
     )
     .await?;
-    if let Some((_, Some(secret))) = torrent.filter(|_| !args.execute) {
+    if let Some((_, Some(secret))) = torrent.filter(|_| dry_run) {
         for c in report
             .changes
             .iter_mut()
@@ -270,6 +265,7 @@ fn torrent_provider(name: &str) -> Result<ClientProvider> {
 
 fn torrent_client(
     args: &ConfigureArgs,
+    dry_run: bool,
     get_secret: impl Fn(&str) -> Result<String>,
 ) -> Result<Option<(ResolvedDownloadClient, Option<String>)>> {
     let Some(client) = args.torrent_client.as_deref() else {
@@ -291,9 +287,9 @@ fn torrent_client(
             .clone()
             .unwrap_or_else(|| "mylar3.torrent_password".to_string())
     });
-    let password = match (&secret, args.execute) {
-        (Some(secret), true) => Some(get_secret(secret)?),
-        (Some(_), false) => Some(DRY_RUN_PASSWORD.to_string()),
+    let password = match (&secret, dry_run) {
+        (Some(secret), false) => Some(get_secret(secret)?),
+        (Some(_), true) => Some(DRY_RUN_PASSWORD.to_string()),
         (None, _) => None,
     };
     let (directory, client_directory) = match provider {
@@ -328,10 +324,6 @@ pub struct BacklogArgs {
     #[arg(long, default_value_t = DEFAULT_STUCK_HOURS)]
     #[serde(default = "default_stuck_hours")]
     pub stuck_hours: u32,
-    /// Queue the post-processor; omitted, only reports the checked folder and stuck count.
-    #[arg(long)]
-    #[serde(default)]
-    pub execute: bool,
 }
 
 /// Queue Mylar's post-processor over a completed-downloads folder.
@@ -339,13 +331,21 @@ pub struct BacklogArgs {
     domain = "mylar3",
     verb = "backlog.process",
     role = "admin",
-    execute_gated = false
+    execute_gated = false,
+    dry_run_aware = true
 )]
 async fn mylar3_backlog_process(args: BacklogArgs, ctx: &ToolCtx) -> Result<BacklogProcess> {
     const TOOL: &str = "mylar3.backlog.process";
     execute::require_admin(TOOL, ctx)?;
     let m = connect(&args.name).await?;
-    remediate::process_backlog(&args.name, &m, &args.folder, args.stuck_hours, args.execute).await
+    remediate::process_backlog(
+        &args.name,
+        &m,
+        &args.folder,
+        args.stuck_hours,
+        !ctx.dry_run(),
+    )
+    .await
 }
 
 #[orca_struct(args)]
@@ -473,9 +473,32 @@ mod tests {
         }
     }
 
+    fn dry_ctx(role: Option<&str>, dry_run: bool) -> ToolCtx {
+        let mut ctx = ctx(role);
+        ctx.set_dry_run(dry_run);
+        ctx
+    }
+
+    #[test]
+    fn writes_act_by_default_and_honour_dry_run() {
+        let aware = plugin_toolkit::dispatch::dry_run_aware_names();
+        for n in [
+            "mylar3.snatched.resolve",
+            "mylar3.configure",
+            "mylar3.backlog.process",
+        ] {
+            assert!(aware.contains(&n), "{n}");
+        }
+    }
+
     #[tokio::test]
-    async fn configure_requires_admin_on_dry_run() {
-        for role in [Some("user"), None] {
+    async fn configure_requires_admin_with_and_without_dry_run() {
+        for (role, dry_run) in [
+            (Some("user"), false),
+            (Some("user"), true),
+            (None, false),
+            (None, true),
+        ] {
             let args = ConfigureArgs {
                 name: "m".into(),
                 usenet_retention: None,
@@ -487,9 +510,8 @@ mod tests {
                 torrent_directory: None,
                 failed_download_handling: None,
                 failed_auto: None,
-                execute: false,
             };
-            let err = mylar3_configure(args, &ctx(role))
+            let err = mylar3_configure(args, &dry_ctx(role, dry_run))
                 .await
                 .unwrap_err()
                 .to_string();
@@ -510,7 +532,7 @@ mod tests {
         assert!(torrent_provider("sabnzbd").is_err());
     }
 
-    fn torrent_args(username: Option<&str>, secret: Option<&str>, execute: bool) -> ConfigureArgs {
+    fn torrent_args(username: Option<&str>, secret: Option<&str>) -> ConfigureArgs {
         ConfigureArgs {
             name: "m".into(),
             usenet_retention: None,
@@ -522,7 +544,6 @@ mod tests {
             torrent_directory: None,
             failed_download_handling: None,
             failed_auto: None,
-            execute,
         }
     }
 
@@ -536,7 +557,7 @@ mod tests {
 
     #[test]
     fn torrent_client_reads_the_plugin_scoped_secret_by_default() {
-        let (c, secret) = torrent_client(&torrent_args(Some("admin"), None, true), vault)
+        let (c, secret) = torrent_client(&torrent_args(Some("admin"), None), false, vault)
             .unwrap()
             .unwrap();
         assert_eq!(secret.as_deref(), Some("mylar3.torrent_password"));
@@ -545,22 +566,22 @@ mod tests {
 
     #[test]
     fn torrent_client_reads_an_explicit_secret() {
-        let args = torrent_args(Some("admin"), Some("mylar3.m.torrent_password"), true);
-        let (c, _) = torrent_client(&args, vault).unwrap().unwrap();
+        let args = torrent_args(Some("admin"), Some("mylar3.m.torrent_password"));
+        let (c, _) = torrent_client(&args, false, vault).unwrap().unwrap();
         assert_eq!(c.password.as_deref(), Some("SCOPED"));
     }
 
     #[test]
     fn torrent_client_fails_on_a_missing_secret() {
-        let args = torrent_args(Some("admin"), Some("absent"), true);
-        let err = torrent_client(&args, vault).unwrap_err().to_string();
+        let args = torrent_args(Some("admin"), Some("absent"));
+        let err = torrent_client(&args, false, vault).unwrap_err().to_string();
         assert!(err.contains("absent"), "{err}");
     }
 
     #[test]
     fn torrent_client_dry_run_does_not_read_the_secret() {
-        let args = torrent_args(Some("admin"), Some("absent"), false);
-        let (c, secret) = torrent_client(&args, |_| bail!("read on dry run"))
+        let args = torrent_args(Some("admin"), Some("absent"));
+        let (c, secret) = torrent_client(&args, true, |_| bail!("read on dry run"))
             .unwrap()
             .unwrap();
         assert_eq!(secret.as_deref(), Some("absent"));
@@ -569,7 +590,7 @@ mod tests {
 
     #[test]
     fn torrent_client_without_username_sets_no_credentials() {
-        let (c, secret) = torrent_client(&torrent_args(None, None, true), |_| {
+        let (c, secret) = torrent_client(&torrent_args(None, None), false, |_| {
             bail!("read without a username")
         })
         .unwrap()
@@ -580,37 +601,45 @@ mod tests {
     #[test]
     fn torrent_client_rejects_credentials_it_cannot_use_before_the_secret() {
         let no_read = |_: &str| -> Result<String> { bail!("secret read") };
-        let mut args = torrent_args(Some("admin"), None, true);
+        let mut args = torrent_args(Some("admin"), None);
         args.torrent_client = Some("watchdir".into());
-        let err = torrent_client(&args, no_read).unwrap_err().to_string();
+        let err = torrent_client(&args, false, no_read)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("takes no torrent_username"), "{err}");
-        let mut args = torrent_args(None, None, true);
+        let mut args = torrent_args(None, None);
         args.torrent_client = Some("deluge".into());
-        let err = torrent_client(&args, no_read).unwrap_err().to_string();
+        let err = torrent_client(&args, false, no_read)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("needs torrent_username"), "{err}");
     }
 
     #[test]
     fn torrent_client_watchdir_uses_the_directory() {
-        let mut args = torrent_args(None, None, true);
+        let mut args = torrent_args(None, None);
         args.torrent_client = Some("watchdir".into());
         args.torrent_directory = Some("/watch".into());
-        let (c, _) = torrent_client(&args, vault).unwrap().unwrap();
+        let (c, _) = torrent_client(&args, false, vault).unwrap().unwrap();
         assert_eq!(c.provider, Some(ClientProvider::Watchdir));
         assert_eq!(c.directory.as_deref(), Some("/watch"));
         assert!(c.client_directory.is_none());
     }
 
     #[tokio::test]
-    async fn backlog_requires_admin_on_dry_run() {
-        for role in [Some("user"), None] {
+    async fn backlog_requires_admin_with_and_without_dry_run() {
+        for (role, dry_run) in [
+            (Some("user"), false),
+            (Some("user"), true),
+            (None, false),
+            (None, true),
+        ] {
             let args = BacklogArgs {
                 name: "m".into(),
                 folder: "/downloads/complete".into(),
                 stuck_hours: DEFAULT_STUCK_HOURS,
-                execute: false,
             };
-            let err = mylar3_backlog_process(args, &ctx(role))
+            let err = mylar3_backlog_process(args, &dry_ctx(role, dry_run))
                 .await
                 .unwrap_err()
                 .to_string();
@@ -619,15 +648,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_requires_admin_on_dry_run() {
-        for role in [Some("user"), None] {
+    async fn resolve_requires_admin_with_and_without_dry_run() {
+        for (role, dry_run) in [
+            (Some("user"), false),
+            (Some("user"), true),
+            (None, false),
+            (None, true),
+        ] {
             let args = ResolveArgs {
                 name: "m".into(),
                 stuck_hours: DEFAULT_STUCK_HOURS,
                 include_missing: false,
-                execute: false,
             };
-            let err = mylar3_snatched_resolve(args, &ctx(role))
+            let err = mylar3_snatched_resolve(args, &dry_ctx(role, dry_run))
                 .await
                 .unwrap_err()
                 .to_string();

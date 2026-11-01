@@ -179,8 +179,8 @@ pub fn build(
     if retention.drift == Some(true) {
         findings.push(format!(
             "usenet_retention={} sends maxage={} so indexers drop posts before {}; {} of {} \
-             dated Wanted issues were released before that; mylar3.configure --execute raises \
-             it to {}",
+             dated Wanted issues were released before that; mylar3.configure raises it to {} \
+             (--dry-run previews)",
             retention.usenet_retention_days.unwrap_or_default(),
             retention.usenet_retention_days.unwrap_or_default(),
             retention.cutoff_date.as_deref().unwrap_or("?"),
@@ -202,7 +202,8 @@ pub fn build(
     if stuck_snatched.repeat_grabbed > 0 {
         let cause = if ini.flag("failed_download_handling") == Some(false) {
             "failed_download_handling is off, so Mylar keeps no failed list and re-grabs the \
-             same release; mylar3.configure --execute turns it on"
+             same release; mylar3.configure turns it on (--dry-run \
+             previews)"
         } else {
             "earlier grabs never imported and were not failed, so their releases stay \
              eligible; mylar3.snatched.resolve fails them"

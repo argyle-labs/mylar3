@@ -82,18 +82,18 @@ plus detect + remediate tools against a registered endpoint (`mylar3.create`):
 
 ```sh
 orca mylar3.status --name comics                      # findings: retention, post-processing, stuck grabs, torrents
-orca mylar3.configure --name comics                   # dry run: reports settings drift
-orca mylar3.configure --name comics --usenet-retention 6000 --execute
+orca mylar3.configure --name comics --dry-run         # previews the settings drift it would fix
+orca mylar3.configure --name comics --usenet-retention 6000
 orca mylar3.snatched.reconcile --name comics
-orca mylar3.snatched.resolve --name comics --execute
-orca mylar3.backlog.process --name comics --folder /downloads/completed/comics --execute
+orca mylar3.snatched.resolve --name comics
+orca mylar3.backlog.process --name comics --folder /downloads/completed/comics
 orca mylar3.wanted.list --name comics
 orca mylar3.issue.queue --name comics --series Saga --issue-number 12
 orca mylar3.issue.fail --name comics --issue-id 9012
-orca mylar3.configure --name comics --failed-download-handling true --failed-auto true --execute
+orca mylar3.configure --name comics --failed-download-handling true --failed-auto true
 ```
 
-Mylar has no per-setting write: `mylar3.configure --execute` submits the web
+Mylar has no per-setting write: `mylar3.configure` submits the web
 settings form with every checkbox and newznab/torznab provider re-posted at its
 current value. It refuses when this Mylar's form does not match the one it
 knows (missing checkboxes or keys v0.11.0 does not define, `minimal_ini` not
