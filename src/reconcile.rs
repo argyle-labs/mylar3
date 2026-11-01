@@ -11,6 +11,8 @@ use crate::status;
 pub const DEFAULT_CATEGORY: &str = "comics";
 pub const DEFAULT_LIMIT: usize = 200;
 pub const MAX_LIMIT: usize = 1000;
+/// Stuck grabs `resolve` will act on in one run; more is an error, never a truncation.
+pub const RESOLVE_CAP: usize = 50_000;
 pub const DEFAULT_MISSING_AFTER_DAYS: u32 = 14;
 const CANDIDATES: usize = 3;
 
@@ -81,6 +83,46 @@ pub struct ReconcileReport {
     pub rows: Vec<ReconciledSnatch>,
 }
 
+struct Inputs {
+    sab_host: String,
+    category: String,
+    history: Vec<Snatch>,
+    queue: Vec<HistorySlot>,
+    slots: Vec<HistorySlot>,
+}
+
+async fn fetch(m: &Mylar, stuck_hours: u32) -> Result<Inputs> {
+    let ini = m.config().await?;
+    let (host, key, category) = sab_settings(&ini)?;
+    let history = status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
+    let sab = Sab::new(host, key);
+    let queue = sab.queue().await?;
+    let slots = sab.history().await?;
+    Ok(Inputs {
+        sab_host: sab.base().to_string(),
+        category,
+        history,
+        queue,
+        slots,
+    })
+}
+
+impl Inputs {
+    fn build(&self, name: &str, stuck_hours: u32, now: Timestamp, page: Page) -> ReconcileReport {
+        build(
+            name,
+            &self.sab_host,
+            &self.category,
+            &self.history,
+            &self.queue,
+            &self.slots,
+            stuck_hours,
+            now,
+            page,
+        )
+    }
+}
+
 pub async fn reconcile(
     name: &str,
     m: &Mylar,
@@ -88,23 +130,42 @@ pub async fn reconcile(
     offset: usize,
     limit: usize,
 ) -> Result<ReconcileReport> {
-    let ini = m.config().await?;
-    let (host, key, category) = sab_settings(&ini)?;
-    let history = status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
-    let sab = Sab::new(host, key);
-    let queue = sab.queue().await?;
-    let slots = sab.history().await?;
-    Ok(build(
-        name,
-        sab.base(),
-        &category,
-        &history,
-        &queue,
-        &slots,
-        stuck_hours,
-        Timestamp::now(),
-        Page { offset, limit },
-    ))
+    let inputs = fetch(m, stuck_hours).await?;
+    Ok(inputs.build(name, stuck_hours, Timestamp::now(), Page { offset, limit }))
+}
+
+/// Pages `page_fn` until every stuck grab is read; errors when the total exceeds `cap`.
+fn every_stuck(
+    cap: usize,
+    mut page_fn: impl FnMut(Page) -> ReconcileReport,
+) -> Result<(ReconcileSummary, Vec<ReconciledSnatch>)> {
+    let first = page_fn(Page {
+        offset: 0,
+        limit: MAX_LIMIT,
+    });
+    let summary = first.summary;
+    if summary.total > cap {
+        bail!(
+            "{} stuck grabs exceed the resolve cap of {cap}; resolve refuses to act on a partial set",
+            summary.total
+        );
+    }
+    let mut rows = first.rows;
+    while rows.len() < summary.total {
+        let page = page_fn(Page {
+            offset: rows.len(),
+            limit: MAX_LIMIT,
+        });
+        if page.rows.is_empty() {
+            bail!(
+                "stuck grabs ended at {} of {} reported",
+                rows.len(),
+                summary.total
+            );
+        }
+        rows.extend(page.rows);
+    }
+    Ok((summary, rows))
 }
 
 #[orca_struct]
@@ -204,19 +265,23 @@ pub async fn resolve(
     missing_after_days: u32,
     execute: bool,
 ) -> Result<ResolveReport> {
-    let report = reconcile(name, m, stuck_hours, 0, MAX_LIMIT).await?;
+    let inputs = fetch(m, stuck_hours).await?;
+    let now = Timestamp::now();
+    let (summary, stuck) = every_stuck(RESOLVE_CAP, |page| {
+        inputs.build(name, stuck_hours, now, page)
+    })?;
     let before = status::utc_as_mylar_local_time(
         Timestamp::now().minus(Duration::from_secs(u64::from(missing_after_days) * 86_400)),
     );
     let guard = Missing {
         before,
         still_snatched: if include_missing {
-            still_snatched(m, &report.rows).await
+            still_snatched(m, &stuck).await
         } else {
             HashSet::new()
         },
     };
-    let mut rows = actions(&report.rows, include_missing.then_some(&guard));
+    let mut rows = actions(&stuck, include_missing.then_some(&guard));
     if execute {
         for row in rows.iter_mut().filter(|r| r.action == "fail") {
             let target = Resolved {
@@ -238,7 +303,7 @@ pub async fn resolve(
         name: name.to_string(),
         threshold_hours: stuck_hours,
         missing_after_days,
-        summary: report.summary,
+        summary,
         failed: rows.iter().filter(|r| r.failed).count(),
         errors: rows.iter().filter(|r| r.error.is_some()).count(),
         rows,
@@ -1035,5 +1100,39 @@ mod tests {
             },
         );
         assert_eq!((r.limit, r.rows.len()), (1, 1));
+    }
+
+    #[test]
+    fn every_stuck_pages_past_max_limit() {
+        let at = old();
+        let history: Vec<Snatch> = (0..2_345)
+            .map(|i| snatch(&i.to_string(), "Saga", &i.to_string(), &at, None))
+            .collect();
+        let mut pages = 0;
+        let (summary, rows) = every_stuck(RESOLVE_CAP, |page| {
+            pages += 1;
+            build("m", "h", "comics", &history, &[], &[], 24, now(), page)
+        })
+        .unwrap();
+        assert_eq!((summary.total, rows.len(), pages), (2_345, 2_345, 3));
+        let ids: HashSet<&str> = rows.iter().map(|r| r.issue_id.as_str()).collect();
+        assert_eq!(ids.len(), 2_345);
+    }
+
+    #[test]
+    fn every_stuck_errors_past_the_cap() {
+        let at = old();
+        let history: Vec<Snatch> = (0..1_001)
+            .map(|i| snatch(&i.to_string(), "Saga", &i.to_string(), &at, None))
+            .collect();
+        let err = every_stuck(1_000, |page| {
+            build("m", "h", "comics", &history, &[], &[], 24, now(), page)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("1001 stuck grabs exceed the resolve cap of 1000"),
+            "{err}"
+        );
     }
 }
