@@ -5,7 +5,7 @@ use crate::api::Mylar;
 use crate::execute;
 use crate::issues::{self, FailReport, QueueReport, WantedReport};
 use crate::logs::{self, LogsReport};
-use crate::reconcile::{self, ReconcileReport};
+use crate::reconcile::{self, ReconcileReport, ResolveReport};
 use crate::remediate::{self, BacklogProcess, ConfigureReport};
 use crate::status::{self, StatusReport};
 
@@ -87,6 +87,45 @@ fn default_reconcile_limit() -> usize {
 async fn mylar3_snatched_reconcile(args: ReconcileArgs, _ctx: &ToolCtx) -> Result<ReconcileReport> {
     let m = connect(&args.name).await?;
     reconcile::reconcile(&args.name, &m, args.stuck_hours, args.offset, args.limit).await
+}
+
+#[orca_struct(args)]
+pub struct ResolveArgs {
+    /// Registered mylar3 endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Only grabs still at Snatched after this many hours are resolved.
+    #[arg(long, default_value_t = DEFAULT_STUCK_HOURS)]
+    #[serde(default = "default_stuck_hours")]
+    pub stuck_hours: u32,
+    /// Also fail grabs SABnzbd has no history for.
+    #[arg(long)]
+    #[serde(default)]
+    pub include_missing: bool,
+    /// Fail the releases; omitted, only reports what would be failed.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
+}
+
+/// Fail each stuck Snatched grab SABnzbd reports failed, so Mylar skips that release; completed ones are listed for `mylar3.backlog.process`.
+#[orca_tool(
+    domain = "mylar3",
+    verb = "snatched.resolve",
+    role = "admin",
+    execute_gated = false
+)]
+async fn mylar3_snatched_resolve(args: ResolveArgs, ctx: &ToolCtx) -> Result<ResolveReport> {
+    execute::require_admin("mylar3.snatched.resolve", ctx)?;
+    let m = connect(&args.name).await?;
+    reconcile::resolve(
+        &args.name,
+        &m,
+        args.stuck_hours,
+        args.include_missing,
+        args.execute,
+    )
+    .await
 }
 
 #[orca_struct(args)]
@@ -576,6 +615,23 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.starts_with("mylar3.backlog.process"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_requires_admin_on_dry_run() {
+        for role in [Some("user"), None] {
+            let args = ResolveArgs {
+                name: "m".into(),
+                stuck_hours: DEFAULT_STUCK_HOURS,
+                include_missing: false,
+                execute: false,
+            };
+            let err = mylar3_snatched_resolve(args, &ctx(role))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("mylar3.snatched.resolve"), "{err}");
         }
     }
 

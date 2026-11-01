@@ -84,6 +84,8 @@ plus detect + remediate tools against a registered endpoint (`mylar3.create`):
 orca mylar3.status --name comics                      # findings: retention, post-processing, stuck grabs, torrents
 orca mylar3.configure --name comics                   # dry run: reports settings drift
 orca mylar3.configure --name comics --usenet-retention 6000 --execute
+orca mylar3.snatched.reconcile --name comics
+orca mylar3.snatched.resolve --name comics --execute
 orca mylar3.backlog.process --name comics --folder /downloads/completed/comics --execute
 orca mylar3.wanted.list --name comics
 orca mylar3.issue.queue --name comics --series Saga --issue-number 12
@@ -97,7 +99,9 @@ current value. It refuses when this Mylar's form does not match the one it
 knows (missing checkboxes or keys v0.11.0 does not define, `minimal_ini` not
 False), fails if the settings changed since the plan, and fails, listing what
 moved, if anything besides the planned changes moved on write. Without `--usenet-retention` it only
-raises retention below 6000. `backlog.process` only accepts a folder inside
+raises retention, to the larger of 6000 and the days back to the oldest Wanted
+issue, and turns `failed_download_handling` on unless
+`--failed-download-handling false` is given. `backlog.process` only accepts a folder inside
 `sab_directory` or `check_folder` and clear of the library.
 
 `status`, `configure` and `backlog.process` all read Mylar's settings from the

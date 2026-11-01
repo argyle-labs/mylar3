@@ -2,6 +2,7 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::time::Timestamp;
 
 use crate::api::{ConfigIni, Mylar, Snatch};
+use crate::issues::{self, Resolved};
 use crate::sab::{HistorySlot, Sab};
 use crate::status;
 
@@ -97,6 +98,97 @@ pub async fn reconcile(
         Timestamp::now(),
         Page { offset, limit },
     ))
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGrab {
+    pub issue_id: String,
+    pub comic: String,
+    pub issue: String,
+    pub class: String,
+    /// `fail` (release goes on Mylar's failed list), `post_process` (SAB finished it; run `mylar3.backlog.process` on its folder) or `none`.
+    pub action: String,
+    /// SAB's storage path for a completed download.
+    pub storage: Option<String>,
+    /// The fail went through and Mylar re-read the issue as no longer Snatched by that grab.
+    pub failed: bool,
+    pub error: Option<String>,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveReport {
+    pub name: String,
+    pub threshold_hours: u32,
+    pub summary: ReconcileSummary,
+    /// Grabs whose release was failed.
+    pub failed: usize,
+    /// Grabs that needed a fail which did not go through.
+    pub errors: usize,
+    pub rows: Vec<ResolvedGrab>,
+    pub dry_run: bool,
+}
+
+pub fn actions(rows: &[ReconciledSnatch], include_missing: bool) -> Vec<ResolvedGrab> {
+    rows.iter()
+        .map(|r| {
+            let action = match r.class.as_str() {
+                "sab_failed" => "fail",
+                "sab_missing" if include_missing => "fail",
+                "sab_completed" => "post_process",
+                _ => "none",
+            };
+            ResolvedGrab {
+                issue_id: r.issue_id.clone(),
+                comic: r.comic.clone(),
+                issue: r.issue.clone(),
+                class: r.class.clone(),
+                action: action.to_string(),
+                storage: r.sab.as_ref().and_then(|s| s.storage.clone()),
+                failed: false,
+                error: None,
+            }
+        })
+        .collect()
+}
+
+/// Fail every stuck grab SAB reports failed (and, with `include_missing`, every grab SAB never saw).
+pub async fn resolve(
+    name: &str,
+    m: &Mylar,
+    stuck_hours: u32,
+    include_missing: bool,
+    execute: bool,
+) -> Result<ResolveReport> {
+    let report = reconcile(name, m, stuck_hours, 0, MAX_LIMIT).await?;
+    let mut rows = actions(&report.rows, include_missing);
+    if execute {
+        for row in rows.iter_mut().filter(|r| r.action == "fail") {
+            let target = Resolved {
+                issue_id: row.issue_id.clone(),
+                comic_id: None,
+                series_name: None,
+                number: None,
+                status: None,
+                annual: false,
+                story_arc: None,
+            };
+            match issues::fail(name, m, target).await {
+                Ok(_) => row.failed = true,
+                Err(e) => row.error = Some(format!("{e:#}")),
+            }
+        }
+    }
+    Ok(ResolveReport {
+        name: name.to_string(),
+        threshold_hours: stuck_hours,
+        summary: report.summary,
+        failed: rows.iter().filter(|r| r.failed).count(),
+        errors: rows.iter().filter(|r| r.error.is_some()).count(),
+        rows,
+        dry_run: !execute,
+    })
 }
 
 fn sab_settings(ini: &ConfigIni) -> Result<(&str, &str, String)> {
@@ -500,6 +592,102 @@ mod tests {
             assert!(r.rows[0].sab.as_ref().unwrap().storage.is_none());
             let out = serde_json::to_string(&r).unwrap();
             assert!(!out.contains("SABKEY"), "{out}");
+        })
+    }
+
+    #[test]
+    fn actions_fail_only_dead_grabs() {
+        let at = old();
+        let history = vec![
+            snatch("1", "Saga", "1", &at, None),
+            snatch("2", "Saga", "2", &at, None),
+            snatch("5", "Monstress", "7", &at, None),
+            snatch("6", "Saga", "5", &at, None),
+        ];
+        let slots = vec![
+            slot("a", "Saga 001", "Completed", 10),
+            slot("b", "Saga 002", "Failed", 11),
+            slot("d", "Saga 005", "Extracting", 14),
+        ];
+        let r = build(
+            "m",
+            "h",
+            "comics",
+            &history,
+            &slots,
+            24,
+            now(),
+            Page::default(),
+        );
+        let of = |rows: &[ResolvedGrab], id: &str| {
+            rows.iter()
+                .find(|r| r.issue_id == id)
+                .unwrap()
+                .action
+                .clone()
+        };
+        let rows = actions(&r.rows, false);
+        assert_eq!(of(&rows, "1"), "post_process");
+        assert_eq!(of(&rows, "2"), "fail");
+        assert_eq!(of(&rows, "5"), "none");
+        assert_eq!(of(&rows, "6"), "none");
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.issue_id == "1")
+                .unwrap()
+                .storage
+                .as_deref(),
+            Some("/downloads/completed/comics/Saga 001")
+        );
+        assert_eq!(of(&actions(&r.rows, true), "5"), "fail");
+    }
+
+    #[test]
+    fn resolve_dry_run_writes_nothing_and_execute_reports_errors() {
+        crate::mock::run(async {
+            let mylar = MockServer::start().await;
+            let sab = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/getConfig"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "aaData": [["sab_host", sab.uri()], ["sab_apikey", "SABKEY"],
+                               ["sab_category", "comics"], ["failed_download_handling", "False"]]
+                })))
+                .mount(&mylar)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "getHistory"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": [{"IssueID": "1", "ComicName": "Saga", "Issue_Number": "1",
+                              "DateAdded": old(), "Status": "Snatched"}]
+                })))
+                .mount(&mylar)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("mode", "history"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": {"noofslots": 1, "slots": [
+                        {"nzo_id": "a", "name": "Saga 001", "status": "Failed", "completed": 5}
+                    ]}
+                })))
+                .mount(&sab)
+                .await;
+            let m = Mylar::new(&mylar.uri(), "KEY", None);
+            let r = resolve("m", &m, 24, false, false).await.unwrap();
+            assert!(r.dry_run);
+            assert_eq!(
+                (r.rows[0].action.as_str(), r.failed, r.errors),
+                ("fail", 0, 0)
+            );
+            let r = resolve("m", &m, 24, false, true).await.unwrap();
+            assert_eq!((r.failed, r.errors), (0, 1));
+            let err = r.rows[0].error.as_deref().unwrap();
+            assert!(err.contains("failed_download_handling off"), "{err}");
+            let reqs = mylar.received_requests().await.unwrap();
+            assert!(reqs.iter().all(|q| q.url.path() != "/failed_handling"));
         })
     }
 

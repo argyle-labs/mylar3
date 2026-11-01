@@ -192,7 +192,8 @@ pub fn build(
     findings.extend(post_processing_findings(&ini, &post_processing));
     if stuck_snatched.count > 0 {
         findings.push(format!(
-            "{} issues stuck at Snatched for more than {}h (oldest {})",
+            "{} issues stuck at Snatched for more than {}h (oldest {}); \
+             mylar3.snatched.resolve fails the dead grabs",
             stuck_snatched.count,
             stuck_hours,
             stuck_snatched.oldest.as_deref().unwrap_or("?"),
@@ -203,7 +204,8 @@ pub fn build(
             "failed_download_handling is off, so Mylar keeps no failed list and re-grabs the \
              same release; mylar3.configure --execute turns it on"
         } else {
-            "earlier grabs never imported and were not failed, so their releases stay eligible"
+            "earlier grabs never imported and were not failed, so their releases stay \
+             eligible; mylar3.snatched.resolve fails them"
         };
         findings.push(format!(
             "{} issues grabbed more than once: {cause}",
