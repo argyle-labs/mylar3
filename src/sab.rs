@@ -21,7 +21,7 @@ pub struct HistorySlot {
     pub nzo_id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "filename")]
     pub nzb_name: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
@@ -37,8 +37,9 @@ pub struct HistorySlot {
 
 #[derive(Deserialize)]
 #[serde(crate = "plugin_toolkit::serde")]
-struct HistoryReply {
+struct Reply {
     history: Option<History>,
+    queue: Option<History>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -71,13 +72,12 @@ impl Sab {
         &self.base
     }
 
-    async fn page(&self, category: &str, start: usize) -> Result<History> {
+    async fn page(&self, mode: &str, start: usize) -> Result<History> {
         let start = start.to_string();
         let limit = PAGE.to_string();
         let query = [
-            ("mode", "history"),
+            ("mode", mode),
             ("output", "json"),
-            ("cat", category),
             ("start", start.as_str()),
             ("limit", limit.as_str()),
             ("apikey", self.api_key.as_str()),
@@ -97,35 +97,49 @@ impl Sab {
             .get(format!("{}/api?{query}", self.base))
             .send()
             .await
-            .map_err(|e| anyhow!("sab history: {}", self.redact(&e.to_string())))?;
+            .map_err(|e| anyhow!("sab {mode}: {}", self.redact(&e.to_string())))?;
         let status = resp.status().as_u16();
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| anyhow!("sab history: {}", self.redact(&e.to_string())))?;
+            .map_err(|e| anyhow!("sab {mode}: {}", self.redact(&e.to_string())))?;
         if !(200..300).contains(&status) {
             bail!(
-                "sab history: HTTP {status}: {}",
+                "sab {mode}: HTTP {status}: {}",
                 clip(&self.redact(&String::from_utf8_lossy(&bytes)))
             );
         }
-        let reply: HistoryReply = serde_json::from_slice(&bytes).map_err(|_| {
+        let reply: Reply = serde_json::from_slice(&bytes).map_err(|_| {
             anyhow!(
-                "sab history: non-JSON reply: {}",
+                "sab {mode}: non-JSON reply: {}",
                 clip(&self.redact(&String::from_utf8_lossy(&bytes)))
             )
         })?;
-        match (reply.history, reply.error) {
-            (_, Some(e)) => bail!("sab history refused: {}", self.redact(&e)),
+        let body = if mode == "queue" {
+            reply.queue
+        } else {
+            reply.history
+        };
+        match (body, reply.error) {
+            (_, Some(e)) => bail!("sab {mode} refused: {}", self.redact(&e)),
             (Some(h), None) => Ok(h),
-            (None, None) => bail!("sab history: reply has no history"),
+            (None, None) => bail!("sab {mode}: reply has no {mode}"),
         }
     }
 
-    pub async fn history(&self, category: &str) -> Result<Vec<HistorySlot>> {
+    /// History across every category, so jobs filed under another category still match.
+    pub async fn history(&self) -> Result<Vec<HistorySlot>> {
+        self.all("history").await
+    }
+
+    pub async fn queue(&self) -> Result<Vec<HistorySlot>> {
+        self.all("queue").await
+    }
+
+    async fn all(&self, mode: &str) -> Result<Vec<HistorySlot>> {
         let mut out = Vec::new();
         for n in 0..MAX_PAGES {
-            let page = self.page(category, n * PAGE).await?;
+            let page = self.page(mode, n * PAGE).await?;
             let got = page.slots.len();
             out.extend(page.slots);
             if got < PAGE || out.len() >= page.noofslots {
@@ -169,7 +183,6 @@ mod tests {
                 Mock::given(method("GET"))
                     .and(path("/api"))
                     .and(query_param("mode", "history"))
-                    .and(query_param("cat", "comics"))
                     .and(query_param("apikey", "SABKEY"))
                     .and(query_param("start", &start.to_string()))
                     .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -179,9 +192,42 @@ mod tests {
                     .await;
             }
             let sab = Sab::new(&server.uri(), "SABKEY");
-            let h = sab.history("comics").await.unwrap();
+            let h = sab.history().await.unwrap();
             assert_eq!(h.len(), PAGE + 3);
             assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        })
+    }
+
+    #[test]
+    fn history_spans_categories_and_queue_reads_filenames() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("mode", "queue"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "queue": {"noofslots": 1, "slots": [
+                        {"nzo_id": "q", "filename": "Saga 001", "status": "Downloading", "cat": "comics"}
+                    ]}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("mode", "history"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": {"noofslots": 0, "slots": []}
+                })))
+                .mount(&server)
+                .await;
+            let sab = Sab::new(&server.uri(), "SABKEY");
+            let q = sab.queue().await.unwrap();
+            assert_eq!(q[0].nzb_name.as_deref(), Some("Saga 001"));
+            sab.history().await.unwrap();
+            let reqs = server.received_requests().await.unwrap();
+            assert!(reqs
+                .iter()
+                .all(|r| !r.url.query().unwrap_or_default().contains("cat=")));
         })
     }
 
@@ -207,7 +253,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let err = Sab::new(&server.uri(), "SABKEY")
-                .history("comics")
+                .history()
                 .await
                 .unwrap_err()
                 .to_string();
@@ -215,7 +261,7 @@ mod tests {
             let err = format!(
                 "{:#}",
                 Sab::new("http://127.0.0.1:1", "SABKEY")
-                    .history("comics")
+                    .history()
                     .await
                     .unwrap_err()
             );

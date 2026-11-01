@@ -379,7 +379,7 @@ fn post_processing_findings(ini: &ConfigIni, pp: &PostProcessingCheck) -> Vec<St
     out
 }
 
-fn utc_as_mylar_local_time(t: Timestamp) -> String {
+pub fn utc_as_mylar_local_time(t: Timestamp) -> String {
     t.to_rfc3339()
         .replacen('T', " ", 1)
         .trim_end_matches('Z')

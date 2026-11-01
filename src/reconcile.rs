@@ -1,6 +1,7 @@
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::time::Timestamp;
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::api::{ConfigIni, Mylar, Snatch};
 use crate::issues::{self, Resolved};
@@ -10,6 +11,7 @@ use crate::status;
 pub const DEFAULT_CATEGORY: &str = "comics";
 pub const DEFAULT_LIMIT: usize = 200;
 pub const MAX_LIMIT: usize = 1000;
+pub const DEFAULT_MISSING_AFTER_DAYS: u32 = 14;
 const CANDIDATES: usize = 3;
 
 #[orca_struct]
@@ -28,6 +30,7 @@ pub struct SabEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconciledSnatch {
     pub issue_id: String,
+    pub comic_id: Option<String>,
     pub comic: String,
     pub issue: String,
     /// Mylar's local time.
@@ -41,9 +44,9 @@ pub struct ReconciledSnatch {
     pub class: String,
     /// `nzo_id` or `name`.
     pub matched_by: Option<String>,
-    /// Newest matching SAB history entry.
+    /// Matching SAB queue job, else newest matching history entry.
     pub sab: Option<SabEntry>,
-    /// SAB history entries matching this issue.
+    /// SAB queue and history entries matching this issue.
     pub sab_matches: usize,
     /// For `name_mismatch`: newest SAB job names for the series that carry no matching issue number.
     pub candidates: Vec<String>,
@@ -68,8 +71,9 @@ pub struct ReconcileReport {
     /// SAB base URL as Mylar holds it.
     pub sab_host: String,
     pub sab_category: String,
-    /// SAB history entries read for the category.
+    /// SAB history entries read, across every category.
     pub sab_history_entries: usize,
+    pub sab_queue_entries: usize,
     /// Counts over every stuck grab, not just this page.
     pub summary: ReconcileSummary,
     pub offset: usize,
@@ -88,12 +92,14 @@ pub async fn reconcile(
     let (host, key, category) = sab_settings(&ini)?;
     let history = status::current(m, m.history().await?, stuck_hours, Timestamp::now()).await?;
     let sab = Sab::new(host, key);
-    let slots = sab.history(&category).await?;
+    let queue = sab.queue().await?;
+    let slots = sab.history().await?;
     Ok(build(
         name,
         sab.base(),
         &category,
         &history,
+        &queue,
         &slots,
         stuck_hours,
         Timestamp::now(),
@@ -108,10 +114,12 @@ pub struct ResolvedGrab {
     pub comic: String,
     pub issue: String,
     pub class: String,
-    /// `fail` (release goes on Mylar's failed list), `post_process` (SAB finished it; run `mylar3.backlog.process` on its folder) or `none`.
+    /// `fail` (release goes on Mylar's failed list), `post_process` (SAB finished it; run `mylar3.backlog.process` on its folder), `review` (SAB has no record but the grab is not provably dead) or `none`.
     pub action: String,
     /// SAB's storage path for a completed download.
     pub storage: Option<String>,
+    /// Why a `sab_missing` grab is `review` rather than `fail`.
+    pub reason: Option<String>,
     /// The fail went through and Mylar re-read the issue as no longer Snatched by that grab.
     pub failed: bool,
     pub error: Option<String>,
@@ -122,6 +130,8 @@ pub struct ResolvedGrab {
 pub struct ResolveReport {
     pub name: String,
     pub threshold_hours: u32,
+    /// `sab_missing` grabs younger than this stay `review`.
+    pub missing_after_days: u32,
     pub summary: ReconcileSummary,
     /// Grabs whose release was failed.
     pub failed: usize,
@@ -131,13 +141,42 @@ pub struct ResolveReport {
     pub dry_run: bool,
 }
 
-pub fn actions(rows: &[ReconciledSnatch], include_missing: bool) -> Vec<ResolvedGrab> {
+/// Guards a `sab_missing` grab must clear before `--include-missing` fails it.
+pub struct Missing {
+    /// Mylar-local time; grabs snatched at or after it are too young to call dead.
+    pub before: String,
+    /// Issues Mylar's issue table still shows as `Snatched`.
+    pub still_snatched: HashSet<String>,
+}
+
+fn missing_reason(r: &ReconciledSnatch, m: &Missing) -> Option<String> {
+    if r.snatched_at.is_empty() || r.snatched_at >= m.before {
+        return Some(format!(
+            "snatched {} is newer than the missing cutoff {}",
+            r.snatched_at, m.before
+        ));
+    }
+    if !m.still_snatched.contains(&r.issue_id) {
+        return Some("mylar does not show the issue as still Snatched".to_string());
+    }
+    None
+}
+
+pub fn actions(rows: &[ReconciledSnatch], missing: Option<&Missing>) -> Vec<ResolvedGrab> {
     rows.iter()
         .map(|r| {
-            let action = match r.class.as_str() {
-                "sab_failed" => "fail",
-                "sab_missing" if include_missing => "fail",
-                "sab_completed" => "post_process",
+            let mut reason = None;
+            let action = match (r.class.as_str(), missing) {
+                ("sab_failed", _) => "fail",
+                ("sab_missing", Some(m)) => {
+                    reason = missing_reason(r, m);
+                    if reason.is_some() {
+                        "review"
+                    } else {
+                        "fail"
+                    }
+                }
+                ("sab_completed", _) => "post_process",
                 _ => "none",
             };
             ResolvedGrab {
@@ -147,6 +186,7 @@ pub fn actions(rows: &[ReconciledSnatch], include_missing: bool) -> Vec<Resolved
                 class: r.class.clone(),
                 action: action.to_string(),
                 storage: r.sab.as_ref().and_then(|s| s.storage.clone()),
+                reason,
                 failed: false,
                 error: None,
             }
@@ -154,16 +194,29 @@ pub fn actions(rows: &[ReconciledSnatch], include_missing: bool) -> Vec<Resolved
         .collect()
 }
 
-/// Fail every stuck grab SAB reports failed (and, with `include_missing`, every grab SAB never saw).
+/// Fail every stuck grab SAB reports failed (and, with `include_missing`, every grab SAB has no queue
+/// or history record of that is older than `missing_after_days` and Mylar still shows Snatched).
 pub async fn resolve(
     name: &str,
     m: &Mylar,
     stuck_hours: u32,
     include_missing: bool,
+    missing_after_days: u32,
     execute: bool,
 ) -> Result<ResolveReport> {
     let report = reconcile(name, m, stuck_hours, 0, MAX_LIMIT).await?;
-    let mut rows = actions(&report.rows, include_missing);
+    let before = status::utc_as_mylar_local_time(
+        Timestamp::now().minus(Duration::from_secs(u64::from(missing_after_days) * 86_400)),
+    );
+    let guard = Missing {
+        before,
+        still_snatched: if include_missing {
+            still_snatched(m, &report.rows).await
+        } else {
+            HashSet::new()
+        },
+    };
+    let mut rows = actions(&report.rows, include_missing.then_some(&guard));
     if execute {
         for row in rows.iter_mut().filter(|r| r.action == "fail") {
             let target = Resolved {
@@ -184,12 +237,36 @@ pub async fn resolve(
     Ok(ResolveReport {
         name: name.to_string(),
         threshold_hours: stuck_hours,
+        missing_after_days,
         summary: report.summary,
         failed: rows.iter().filter(|r| r.failed).count(),
         errors: rows.iter().filter(|r| r.error.is_some()).count(),
         rows,
         dry_run: !execute,
     })
+}
+
+/// A series that cannot be read leaves its issues out, so they stay `review`.
+async fn still_snatched(m: &Mylar, rows: &[ReconciledSnatch]) -> HashSet<String> {
+    let comics: HashSet<&str> = rows
+        .iter()
+        .filter(|r| r.class == "sab_missing")
+        .filter_map(|r| r.comic_id.as_deref())
+        .collect();
+    let mut out = HashSet::new();
+    for id in comics {
+        let Ok(c) = m.comic(id).await else {
+            continue;
+        };
+        out.extend(
+            c.issues
+                .into_iter()
+                .chain(c.annuals)
+                .filter(|i| i.status.as_deref() == Some("Snatched"))
+                .filter_map(|i| i.id),
+        );
+    }
+    out
 }
 
 fn sab_settings(ini: &ConfigIni) -> Result<(&str, &str, String)> {
@@ -227,6 +304,7 @@ pub fn build(
     sab_host: &str,
     category: &str,
     history: &[Snatch],
+    queue: &[HistorySlot],
     slots: &[HistorySlot],
     stuck_hours: u32,
     now: Timestamp,
@@ -234,8 +312,11 @@ pub fn build(
 ) -> ReconcileReport {
     let limit = page.limit.clamp(1, MAX_LIMIT);
     let (stuck, grabs) = status::stuck_snatches(history, stuck_hours, now);
-    let named: Vec<(Vec<String>, &HistorySlot)> =
-        slots.iter().map(|s| (tokens(slot_name(s)), s)).collect();
+    let named: Vec<(Vec<String>, &HistorySlot)> = queue
+        .iter()
+        .chain(slots)
+        .map(|s| (tokens(slot_name(s)), s))
+        .collect();
     let mut summary = ReconcileSummary::default();
     let rows: Vec<ReconciledSnatch> = stuck
         .into_iter()
@@ -263,6 +344,7 @@ pub fn build(
         sab_host: sab_host.to_string(),
         sab_category: category.to_string(),
         sab_history_entries: slots.len(),
+        sab_queue_entries: queue.len(),
         summary,
         offset: page.offset,
         limit,
@@ -311,7 +393,11 @@ fn classify(s: &Snatch, grabs: usize, named: &[(Vec<String>, &HistorySlot)]) -> 
     } else {
         (None, Vec::new())
     };
-    let newest = matches.iter().max_by_key(|slot| slot.completed).copied();
+    // Queue jobs carry no `completed`; a live job outranks any older history outcome.
+    let newest = matches
+        .iter()
+        .max_by_key(|slot| (slot.completed.is_none(), slot.completed))
+        .copied();
     let class = match newest.map(|slot| slot.status.as_deref().unwrap_or_default()) {
         Some("Completed") => "sab_completed",
         Some("Failed") => "sab_failed",
@@ -327,6 +413,7 @@ fn classify(s: &Snatch, grabs: usize, named: &[(Vec<String>, &HistorySlot)]) -> 
     candidates.sort_by_key(|slot| std::cmp::Reverse(slot.completed));
     ReconciledSnatch {
         issue_id: s.issue_id.clone().unwrap_or_default(),
+        comic_id: s.comic_id.clone(),
         comic,
         issue,
         snatched_at: s.date_added.clone().unwrap_or_default(),
@@ -456,6 +543,153 @@ mod tests {
             .to_string()
     }
 
+    fn guard() -> Missing {
+        Missing {
+            before: now().to_rfc3339().replacen('T', " ", 1)[..19].to_string(),
+            still_snatched: ["5".to_string()].into(),
+        }
+    }
+
+    fn missing_row() -> ReconciledSnatch {
+        let r = build(
+            "m",
+            "h",
+            "comics",
+            &[snatch("5", "Monstress", "7", &old(), None)],
+            &[],
+            &[],
+            24,
+            now(),
+            Page::default(),
+        );
+        r.rows[0].clone()
+    }
+
+    #[test]
+    fn queued_job_is_pending_not_missing() {
+        let at = old();
+        let history = vec![snatch("5", "Monstress", "7", &at, None)];
+        let queue = vec![HistorySlot {
+            nzo_id: Some("q".into()),
+            nzb_name: Some("Monstress 007 (2016)".into()),
+            status: Some("Downloading".into()),
+            ..Default::default()
+        }];
+        let slots = vec![slot("a", "Monstress 007 (2016)", "Failed", 10)];
+        let r = build(
+            "m",
+            "h",
+            "comics",
+            &history,
+            &queue,
+            &slots,
+            24,
+            now(),
+            Page::default(),
+        );
+        assert_eq!(r.rows[0].class, "sab_pending");
+        assert_eq!(r.sab_queue_entries, 1);
+        assert_eq!(actions(&r.rows, Some(&guard()))[0].action, "none");
+    }
+
+    #[test]
+    fn young_missing_grab_is_review() {
+        let row = missing_row();
+        let g = Missing {
+            before: old(),
+            ..guard()
+        };
+        let a = &actions(&[row], Some(&g))[0];
+        assert_eq!(a.action, "review");
+        assert!(a.reason.as_deref().unwrap().contains("newer"), "{a:?}");
+    }
+
+    #[test]
+    fn missing_grab_mylar_moved_on_is_review() {
+        let row = missing_row();
+        let g = Missing {
+            still_snatched: HashSet::new(),
+            ..guard()
+        };
+        let a = &actions(std::slice::from_ref(&row), Some(&g))[0];
+        assert_eq!(a.action, "review");
+        assert!(a.reason.as_deref().unwrap().contains("Snatched"), "{a:?}");
+        let a = &actions(&[row], Some(&guard()))[0];
+        assert_eq!((a.action.as_str(), a.reason.as_deref()), ("fail", None));
+    }
+
+    #[test]
+    fn resolve_checks_mylar_issue_status_before_failing_missing() {
+        crate::mock::run(async {
+            let mylar = MockServer::start().await;
+            let sab = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/getConfig"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "aaData": [["sab_host", sab.uri()], ["sab_apikey", "SABKEY"]]
+                })))
+                .mount(&mylar)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "getHistory"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": [{"IssueID": "1", "ComicID": "c", "ComicName": "Saga", "Issue_Number": "1",
+                              "DateAdded": "2020-01-01 00:00:00", "Status": "Snatched"},
+                             {"IssueID": "2", "ComicID": "c", "ComicName": "Saga", "Issue_Number": "2",
+                              "DateAdded": "2020-01-01 00:00:00", "Status": "Snatched"}]
+                })))
+                .mount(&mylar)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "getComic"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": {"comic": [], "issues": [
+                        {"id": "1", "status": "Snatched"}, {"id": "2", "status": "Snatched"}
+                    ], "annuals": []}
+                })))
+                .up_to_n_times(1)
+                .mount(&mylar)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("cmd", "getComic"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": {"comic": [], "issues": [
+                        {"id": "1", "status": "Snatched"}, {"id": "2", "status": "Downloaded"}
+                    ], "annuals": []}
+                })))
+                .mount(&mylar)
+                .await;
+            for mode in ["queue", "history"] {
+                Mock::given(method("GET"))
+                    .and(path("/api"))
+                    .and(query_param("mode", mode))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        mode: {"noofslots": 0, "slots": []}
+                    })))
+                    .mount(&sab)
+                    .await;
+            }
+            let m = Mylar::new(&mylar.uri(), "KEY", None);
+            let r = resolve("m", &m, 24, true, DEFAULT_MISSING_AFTER_DAYS, false)
+                .await
+                .unwrap();
+            assert_eq!(r.summary.sab_missing, 2);
+            let row = |id: &str| r.rows.iter().find(|g| g.issue_id == id).unwrap();
+            assert_eq!(row("1").action, "fail");
+            assert_eq!(row("2").action, "review");
+            let r = resolve("m", &m, 24, false, DEFAULT_MISSING_AFTER_DAYS, false)
+                .await
+                .unwrap();
+            assert!(r.rows.iter().all(|g| g.action == "none"));
+        })
+    }
+
     #[test]
     fn tokens_split_on_punctuation() {
         assert_eq!(
@@ -509,6 +743,7 @@ mod tests {
             "http://sab",
             "comics",
             &history,
+            &[],
             &slots,
             24,
             now(),
@@ -557,6 +792,7 @@ mod tests {
             "comics",
             &[snatch("1", "Saga", "1", &fresh, None)],
             &[],
+            &[],
             24,
             now(),
             Page::default(),
@@ -589,8 +825,15 @@ mod tests {
                 .await;
             Mock::given(method("GET"))
                 .and(path("/api"))
+                .and(query_param("mode", "queue"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "queue": {"noofslots": 0, "slots": []}
+                })))
+                .mount(&sab)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
                 .and(query_param("mode", "history"))
-                .and(query_param("cat", "comics"))
                 .and(query_param("apikey", "SABKEY"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "history": {"noofslots": 1, "slots": [
@@ -629,6 +872,7 @@ mod tests {
             "h",
             "comics",
             &history,
+            &[],
             &slots,
             24,
             now(),
@@ -638,7 +882,7 @@ mod tests {
         assert_eq!(row("1").class, "name_mismatch");
         assert!(row("1").matched_by.is_none());
         assert_eq!(row("2").class, "sab_failed");
-        let rows = actions(&r.rows, true);
+        let rows = actions(&r.rows, Some(&guard()));
         let batman = rows.iter().find(|r| r.issue_id == "1").unwrap();
         assert_eq!(batman.action, "none");
     }
@@ -662,6 +906,7 @@ mod tests {
             "h",
             "comics",
             &history,
+            &[],
             &slots,
             24,
             now(),
@@ -674,7 +919,7 @@ mod tests {
                 .action
                 .clone()
         };
-        let rows = actions(&r.rows, false);
+        let rows = actions(&r.rows, None);
         assert_eq!(of(&rows, "1"), "post_process");
         assert_eq!(of(&rows, "2"), "fail");
         assert_eq!(of(&rows, "5"), "none");
@@ -687,7 +932,7 @@ mod tests {
                 .as_deref(),
             Some("/downloads/completed/comics/Saga 001")
         );
-        assert_eq!(of(&actions(&r.rows, true), "5"), "fail");
+        assert_eq!(of(&actions(&r.rows, Some(&guard())), "5"), "fail");
     }
 
     #[test]
@@ -715,6 +960,14 @@ mod tests {
                 .await;
             Mock::given(method("GET"))
                 .and(path("/api"))
+                .and(query_param("mode", "queue"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "queue": {"noofslots": 0, "slots": []}
+                })))
+                .mount(&sab)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
                 .and(query_param("mode", "history"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "history": {"noofslots": 1, "slots": [
@@ -724,13 +977,17 @@ mod tests {
                 .mount(&sab)
                 .await;
             let m = Mylar::new(&mylar.uri(), "KEY", None);
-            let r = resolve("m", &m, 24, false, false).await.unwrap();
+            let r = resolve("m", &m, 24, false, DEFAULT_MISSING_AFTER_DAYS, false)
+                .await
+                .unwrap();
             assert!(r.dry_run);
             assert_eq!(
                 (r.rows[0].action.as_str(), r.failed, r.errors),
                 ("fail", 0, 0)
             );
-            let r = resolve("m", &m, 24, false, true).await.unwrap();
+            let r = resolve("m", &m, 24, false, DEFAULT_MISSING_AFTER_DAYS, true)
+                .await
+                .unwrap();
             assert_eq!((r.failed, r.errors), (0, 1));
             let err = r.rows[0].error.as_deref().unwrap();
             assert!(err.contains("failed_download_handling off"), "{err}");
@@ -761,13 +1018,14 @@ mod tests {
             offset: 3,
             limit: 10,
         };
-        let r = build("m", "h", "comics", &history, &[], 24, now(), page);
+        let r = build("m", "h", "comics", &history, &[], &[], 24, now(), page);
         assert_eq!((r.summary.total, r.rows.len()), (5, 2));
         let r = build(
             "m",
             "h",
             "comics",
             &history,
+            &[],
             &[],
             24,
             now(),

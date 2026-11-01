@@ -98,10 +98,18 @@ pub struct ResolveArgs {
     #[arg(long, default_value_t = DEFAULT_STUCK_HOURS)]
     #[serde(default = "default_stuck_hours")]
     pub stuck_hours: u32,
-    /// Also fail grabs SABnzbd has no history for.
+    /// Also fail grabs SABnzbd has no queue or history record of, once older than `missing_after_days` and still Snatched in Mylar; others become `review`.
     #[arg(long)]
     #[serde(default)]
     pub include_missing: bool,
+    /// Days a grab must be past before `include_missing` may call it dead; set it above SABnzbd's history retention.
+    #[arg(long, default_value_t = reconcile::DEFAULT_MISSING_AFTER_DAYS)]
+    #[serde(default = "default_missing_after_days")]
+    pub missing_after_days: u32,
+}
+
+fn default_missing_after_days() -> u32 {
+    reconcile::DEFAULT_MISSING_AFTER_DAYS
 }
 
 /// Fail each stuck Snatched grab SABnzbd reports failed, so Mylar skips that release; completed ones are listed for `mylar3.backlog.process`.
@@ -120,6 +128,7 @@ async fn mylar3_snatched_resolve(args: ResolveArgs, ctx: &ToolCtx) -> Result<Res
         &m,
         args.stuck_hours,
         args.include_missing,
+        args.missing_after_days,
         !ctx.dry_run(),
     )
     .await
@@ -659,6 +668,7 @@ mod tests {
                 name: "m".into(),
                 stuck_hours: DEFAULT_STUCK_HOURS,
                 include_missing: false,
+                missing_after_days: reconcile::DEFAULT_MISSING_AFTER_DAYS,
             };
             let err = mylar3_snatched_resolve(args, &dry_ctx(role, dry_run))
                 .await
