@@ -80,6 +80,8 @@ pub struct ReconcileReport {
     pub summary: ReconcileSummary,
     pub offset: usize,
     pub limit: usize,
+    /// Stuck grabs remain past this page.
+    pub truncated: bool,
     pub rows: Vec<ReconciledSnatch>,
 }
 
@@ -403,6 +405,7 @@ pub fn build(
         .skip(page.offset)
         .take(limit)
         .collect();
+    let truncated = page.offset + rows.len() < summary.total;
     ReconcileReport {
         name: name.to_string(),
         threshold_hours: stuck_hours,
@@ -413,6 +416,7 @@ pub fn build(
         summary,
         offset: page.offset,
         limit,
+        truncated,
         rows,
     }
 }
@@ -1084,7 +1088,7 @@ mod tests {
             limit: 10,
         };
         let r = build("m", "h", "comics", &history, &[], &[], 24, now(), page);
-        assert_eq!((r.summary.total, r.rows.len()), (5, 2));
+        assert_eq!((r.summary.total, r.rows.len(), r.truncated), (5, 2, false));
         let r = build(
             "m",
             "h",
@@ -1099,7 +1103,7 @@ mod tests {
                 limit: 0,
             },
         );
-        assert_eq!((r.limit, r.rows.len()), (1, 1));
+        assert_eq!((r.limit, r.rows.len(), r.truncated), (1, 1, true));
     }
 
     #[test]
