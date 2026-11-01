@@ -29,7 +29,7 @@ pub struct HistorySlot {
     pub fail_message: Option<String>,
     #[serde(default)]
     pub storage: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "cat")]
     pub category: Option<String>,
     #[serde(default)]
     pub completed: Option<i64>,

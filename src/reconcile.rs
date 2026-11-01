@@ -56,6 +56,8 @@ pub struct ReconciledSnatch {
     pub sab_matches: usize,
     /// For `name_mismatch`: newest SAB job names for the series that carry no matching issue number.
     pub candidates: Vec<String>,
+    /// Set when the only name match sits outside the configured SAB category; never auto-acted on.
+    pub review: Option<String>,
 }
 
 #[orca_struct]
@@ -245,6 +247,10 @@ pub fn actions(rows: &[ReconciledSnatch], missing: Option<&Missing>) -> Vec<Reso
         .map(|r| {
             let mut reason = None;
             let action = match (r.class.as_str(), missing) {
+                ("sab_failed" | "sab_completed", _) if r.review.is_some() => {
+                    reason = r.review.clone();
+                    "review"
+                }
                 ("sab_failed", _) => "fail",
                 ("sab_missing", Some(m)) => {
                     reason = missing_reason(r, m);
@@ -517,7 +523,12 @@ pub fn classify_all(
         .into_iter()
         .map(|s| {
             let id = s.issue_id.as_deref().unwrap_or_default();
-            let row = classify(s, grabs.get(id).copied().unwrap_or_default(), &index);
+            let row = classify(
+                s,
+                grabs.get(id).copied().unwrap_or_default(),
+                &index,
+                category,
+            );
             summary.total += 1;
             match row.class.as_str() {
                 "sab_completed" => summary.sab_completed += 1,
@@ -573,7 +584,7 @@ fn slot_name(s: &HistorySlot) -> &str {
         .unwrap_or_default()
 }
 
-fn classify(s: &Snatch, grabs: usize, index: &SlotIndex) -> ReconciledSnatch {
+fn classify(s: &Snatch, grabs: usize, index: &SlotIndex, category: &str) -> ReconciledSnatch {
     let nzo_id = s
         .hash
         .clone()
@@ -586,11 +597,33 @@ fn classify(s: &Snatch, grabs: usize, index: &SlotIndex) -> ReconciledSnatch {
         .map(|id| index.by_nzo(id))
         .unwrap_or_default();
     let series = index.series(&comic_tokens);
-    let by_name: Vec<&HistorySlot> = series
+    let named: Vec<&HistorySlot> = series
         .iter()
         .filter(|(t, _)| issue_matches(&issue, t) && same_series(&comic_tokens, &issue, t))
         .map(|(_, slot)| *slot)
         .collect();
+    // A name match decides an outcome only inside the comics category; elsewhere it is review.
+    // A live queue job in any category still outranks history, since pending never acts.
+    let live = named.iter().any(|slot| slot.completed.is_none());
+    let (in_category, elsewhere): (Vec<&HistorySlot>, Vec<&HistorySlot>) =
+        named.into_iter().partition(|slot| {
+            slot.category
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(category))
+        });
+    let review = (in_category.is_empty() && by_id.is_empty() && !live)
+        .then(|| {
+            elsewhere
+                .first()
+                .map(|slot| slot.category.clone().unwrap_or_default())
+        })
+        .flatten()
+        .map(|c| format!("matched a job in category {c}"));
+    let by_name = if in_category.is_empty() || live {
+        in_category.into_iter().chain(elsewhere).collect()
+    } else {
+        in_category
+    };
     let (matched_by, matches) = if !by_id.is_empty() {
         (Some("nzo_id".to_string()), by_id)
     } else if !by_name.is_empty() {
@@ -641,6 +674,7 @@ fn classify(s: &Snatch, grabs: usize, index: &SlotIndex) -> ReconciledSnatch {
             .take(CANDIDATES)
             .map(|slot| slot_name(slot).to_string())
             .collect(),
+        review,
     }
 }
 
@@ -733,7 +767,15 @@ mod tests {
             fail_message: (status == "Failed").then(|| "Download failed".into()),
             storage: (status == "Completed").then(|| format!("/downloads/completed/comics/{name}")),
             completed: Some(completed),
+            category: Some("comics".into()),
             ..Default::default()
+        }
+    }
+
+    fn in_cat(category: &str, s: HistorySlot) -> HistorySlot {
+        HistorySlot {
+            category: Some(category.into()),
+            ..s
         }
     }
 
@@ -1187,6 +1229,97 @@ mod tests {
     }
 
     #[test]
+    fn name_match_in_another_category_is_review_not_fail() {
+        let at = old();
+        let history = vec![snatch("1", "Saga", "1", &at, None)];
+        let slots = vec![in_cat("tv", slot("a", "Saga 001", "Failed", 10))];
+        let r = build(
+            "m",
+            "h",
+            "comics",
+            &history,
+            &[],
+            &slots,
+            24,
+            now(),
+            Page::default(),
+        );
+        assert_eq!(r.rows[0].class, "sab_failed");
+        let rows = actions(&r.rows, Some(&guard()));
+        assert_eq!(rows[0].action, "review");
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some("matched a job in category tv")
+        );
+    }
+
+    #[test]
+    fn name_match_in_sab_category_fails() {
+        let at = old();
+        let history = vec![snatch("1", "Saga", "1", &at, None)];
+        let slots = vec![
+            in_cat("tv", slot("b", "Saga 001", "Completed", 20)),
+            slot("a", "Saga 001", "Failed", 10),
+        ];
+        let r = build(
+            "m",
+            "h",
+            "comics",
+            &history,
+            &[],
+            &slots,
+            24,
+            now(),
+            Page::default(),
+        );
+        assert_eq!(r.rows[0].class, "sab_failed");
+        assert!(r.rows[0].review.is_none());
+        assert_eq!(actions(&r.rows, Some(&guard()))[0].action, "fail");
+    }
+
+    #[test]
+    fn nzo_id_match_in_another_category_fails() {
+        let at = old();
+        let history = vec![snatch("1", "Saga", "1", &at, Some("x"))];
+        let slots = vec![in_cat("tv", slot("x", "Saga 001", "Failed", 10))];
+        let r = build(
+            "m",
+            "h",
+            "comics",
+            &history,
+            &[],
+            &slots,
+            24,
+            now(),
+            Page::default(),
+        );
+        assert_eq!(r.rows[0].matched_by.as_deref(), Some("nzo_id"));
+        assert!(r.rows[0].review.is_none());
+        assert_eq!(actions(&r.rows, Some(&guard()))[0].action, "fail");
+    }
+
+    #[test]
+    fn match_in_another_category_is_not_missing() {
+        let at = old();
+        let history = vec![snatch("5", "Monstress", "7", &at, None)];
+        let slots = vec![in_cat("books", slot("a", "Monstress 007", "Failed", 10))];
+        let r = build(
+            "m",
+            "h",
+            "comics",
+            &history,
+            &[],
+            &slots,
+            24,
+            now(),
+            Page::default(),
+        );
+        assert_ne!(r.rows[0].class, "sab_missing");
+        assert_eq!(r.summary.sab_missing, 0);
+        assert_ne!(actions(&r.rows, Some(&guard()))[0].action, "fail");
+    }
+
+    #[test]
     fn actions_fail_only_dead_grabs() {
         let at = old();
         let history = vec![
@@ -1270,7 +1403,7 @@ mod tests {
                 .and(query_param("mode", "history"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "history": {"noofslots": 1, "slots": [
-                        {"nzo_id": "a", "name": "Saga 001", "status": "Failed", "completed": 5}
+                        {"nzo_id": "a", "name": "Saga 001", "status": "Failed", "completed": 5, "category": "comics"}
                     ]}
                 })))
                 .mount(&sab)
