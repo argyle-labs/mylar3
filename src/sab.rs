@@ -141,12 +141,22 @@ impl Sab {
         for n in 0..MAX_PAGES {
             let page = self.page(mode, n * PAGE).await?;
             let got = page.slots.len();
+            let total = page.noofslots;
             out.extend(page.slots);
-            if got < PAGE || out.len() >= page.noofslots {
-                break;
+            if out.len() >= total {
+                return Ok(out);
+            }
+            if got < PAGE {
+                bail!(
+                    "sab {mode}: read {} of {total} slots, SAB ended early",
+                    out.len()
+                );
             }
         }
-        Ok(out)
+        bail!(
+            "sab {mode}: more than {} slots exceeds the {MAX_PAGES}-page cap; refusing a partial {mode}",
+            MAX_PAGES * PAGE
+        )
     }
 
     fn redact(&self, msg: &str) -> String {
@@ -195,6 +205,49 @@ mod tests {
             let h = sab.history().await.unwrap();
             assert_eq!(h.len(), PAGE + 3);
             assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        })
+    }
+
+    #[test]
+    fn history_over_the_cap_errors() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("mode", "history"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "history": {"noofslots": MAX_PAGES * PAGE + 1, "slots": slots(0, PAGE)}
+                })))
+                .mount(&server)
+                .await;
+            let err = Sab::new(&server.uri(), "SABKEY")
+                .history()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cap"), "{err}");
+            assert_eq!(server.received_requests().await.unwrap().len(), MAX_PAGES);
+        })
+    }
+
+    #[test]
+    fn queue_short_of_noofslots_errors() {
+        crate::mock::run(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api"))
+                .and(query_param("mode", "queue"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "queue": {"noofslots": 10, "slots": slots(0, 3)}
+                })))
+                .mount(&server)
+                .await;
+            let err = Sab::new(&server.uri(), "SABKEY")
+                .queue()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("3 of 10"), "{err}");
         })
     }
 
